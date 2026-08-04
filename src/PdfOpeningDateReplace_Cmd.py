@@ -34,9 +34,11 @@ OLD_RECEPTION_START_TEXT = "令和８年７月１日より受付開始"
 NEW_RECEPTION_START_TEXT = "令和８年８月１日より受付開始"
 
 REQUIRED_WEEKLY_TEXT = "毎週木曜日"
+REQUIRED_RECEPTION_TEXTS = ("募集期間", "(各コース開講前まで応募可能)")
 EXPECTED_PAGE_COUNT = 5
 MAX_FONT_REDUCTION_RATIO = 0.05
 COMPARISON_DPI = 144
+DISPLAY_GROUP_OVERLAP_RATIO = 0.8
 
 
 class ReplacementError(Exception):
@@ -73,6 +75,29 @@ class TextStyle:
 
 
 @dataclass(frozen=True)
+class SearchGroup:
+    """同じ表示位置に重なった検索矩形のグループ。"""
+
+    rectangles: tuple[Any, ...]
+    union_rect: Any
+
+
+@dataclass(frozen=True)
+class TextLayer:
+    """旧文字列を構成する1つの内部テキストレイヤー。"""
+
+    text: str
+    rect: Any
+    font: str
+    size: float
+    color: int
+    flags: int
+    origin: tuple[float, float]
+    ascender: float | None
+    descender: float | None
+
+
+@dataclass(frozen=True)
 class PreparedReplacement:
     """編集前の検査を完了した置換情報。"""
 
@@ -81,6 +106,7 @@ class PreparedReplacement:
     font_path: Path
     font_size: float
     changed_rect: Any
+    deletion_rectangles: tuple[Any, ...]
 
 
 @dataclass(frozen=True)
@@ -178,72 +204,199 @@ def open_pdf(pymupdf: Any, input_path: Path) -> Any:
     return doc
 
 
-def find_target_text(page: Any, spec: ReplacementSpec) -> Any:
-    """指定ページで旧文字列を検索し、厳密に1件の場合だけ返す。"""
-    rectangles = page.search_for(spec.old_text)
+def overlap_ratio(rectangle1: Any, rectangle2: Any) -> float:
+    """交差面積が小さい側の矩形面積に占める割合を返す。"""
+    area1 = rectangle1.get_area()
+    area2 = rectangle2.get_area()
+    if area1 <= 0 or area2 <= 0:
+        return 0.0
+    intersection = rectangle1 & rectangle2
+    if intersection.is_empty:
+        return 0.0
+    return intersection.get_area() / min(area1, area2)
+
+
+def group_overlapping_rectangles(rectangles: Sequence[Any]) -> tuple[SearchGroup, ...]:
+    """80%以上重なる矩形を推移的な表示グループへまとめる。"""
+    if not rectangles:
+        return ()
+    remaining = set(range(len(rectangles)))
+    groups: list[SearchGroup] = []
+    while remaining:
+        pending = [remaining.pop()]
+        members: list[int] = []
+        while pending:
+            current = pending.pop()
+            members.append(current)
+            connected = {
+                candidate
+                for candidate in remaining
+                if overlap_ratio(rectangles[current], rectangles[candidate])
+                >= DISPLAY_GROUP_OVERLAP_RATIO
+            }
+            remaining.difference_update(connected)
+            pending.extend(connected)
+        member_rectangles = tuple(rectangles[index] for index in sorted(members))
+        union_rect = member_rectangles[0].__class__(member_rectangles[0])
+        for rectangle in member_rectangles[1:]:
+            union_rect |= rectangle
+        groups.append(SearchGroup(member_rectangles, union_rect))
+    return tuple(groups)
+
+
+def find_target_text(page: Any, spec: ReplacementSpec) -> SearchGroup:
+    """旧文字列を検索し、表示位置が厳密に1グループの場合だけ返す。"""
+    rectangles = tuple(page.search_for(spec.old_text))
     print(f"変更対象：{spec.label}")
     print(f"対象ページ：{spec.page_index + 1}ページ目")
     print(f"検索文字列：{spec.old_text}")
-    print(f"検出件数：{len(rectangles)}件")
+    print(f"生の検出件数：{len(rectangles)}件")
+    for number, rectangle in enumerate(rectangles, start=1):
+        print(f"検索矩形 {number}：{tuple(rectangle)}")
     if not rectangles:
         raise ReplacementError(
             "変更対象の文字列が見つかりませんでした。",
             f"対象ページ：{spec.page_index + 1}ページ目／検索文字列：{spec.old_text}",
         )
-    if len(rectangles) != 1:
+    if any(rectangle.get_area() <= 0 for rectangle in rectangles):
         raise ReplacementError(
-            "変更対象の文字列が複数見つかったため、処理を中止しました。",
-            f"対象ページ：{spec.page_index + 1}ページ目／検出件数：{len(rectangles)}件",
+            "変更対象の検索結果に不正な矩形が含まれています。",
+            f"処理対象：{spec.label}",
         )
-    return rectangles[0]
+    groups = group_overlapping_rectangles(rectangles)
+    print(f"表示グループ数：{len(groups)}件")
+    if len(groups) != 1:
+        raise ReplacementError(
+            "変更対象が異なる表示位置に複数見つかったため、処理を中止しました。",
+            f"対象ページ：{spec.page_index + 1}ページ目／表示グループ数：{len(groups)}件",
+        )
+    print(f"表示グループの和集合：{tuple(groups[0].union_rect)}")
+    return groups[0]
 
 
-def get_original_text_style(page: Any, target_rect: Any, spec: ReplacementSpec) -> TextStyle:
-    """検索矩形と重なるspanを調査して元書式を取得する。"""
-    spans: list[dict[str, Any]] = []
+def _matching_text_layers(page: Any, spec: ReplacementSpec) -> tuple[TextLayer, ...]:
+    """rawdictから旧文字列を構成するレイヤーと最小文字矩形を取得する。"""
+    layers: list[TextLayer] = []
+    for block in page.get_text("rawdict").get("blocks", []):
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                characters = span.get("chars", [])
+                span_text = "".join(character.get("c", "") for character in characters)
+                start = 0
+                while True:
+                    match_index = span_text.find(spec.old_text, start)
+                    if match_index < 0:
+                        break
+                    matched_characters = characters[
+                        match_index : match_index + len(spec.old_text)
+                    ]
+                    if len(matched_characters) != len(spec.old_text):
+                        break
+                    rect = page.rect.__class__(matched_characters[0]["bbox"])
+                    for character in matched_characters[1:]:
+                        rect |= page.rect.__class__(character["bbox"])
+                    origin_value = matched_characters[0].get(
+                        "origin", span.get("origin", (rect.x0, rect.y1))
+                    )
+                    layers.append(
+                        TextLayer(
+                            spec.old_text,
+                            rect,
+                            str(span.get("font", "")),
+                            float(span.get("size", 0.0)),
+                            int(span.get("color", 0)),
+                            int(span.get("flags", 0)),
+                            (float(origin_value[0]), float(origin_value[1])),
+                            span.get("ascender"),
+                            span.get("descender"),
+                        )
+                    )
+                    start = match_index + len(spec.old_text)
+    return tuple(layers)
+
+
+def _choose_representative_layer(layers: Sequence[TextLayer]) -> TextLayer:
+    """重複レイヤーから多数派かつType3でない代表書式を選ぶ。"""
+    if not layers:
+        raise ReplacementError("元の文字書式を取得できませんでした。")
+    signatures: dict[tuple[str, float, int, int], int] = {}
+    for layer in layers:
+        signature = (layer.font, layer.size, layer.color, layer.flags)
+        signatures[signature] = signatures.get(signature, 0) + 1
+    return max(
+        layers,
+        key=lambda layer: (
+            signatures[(layer.font, layer.size, layer.color, layer.flags)],
+            "t3" not in layer.font.lower() and "type3" not in layer.font.lower(),
+            layer.rect.get_area() > 0,
+        ),
+    )
+
+
+def _ensure_deletion_rectangles_are_safe(
+    page: Any, layers: Sequence[TextLayer], spec: ReplacementSpec
+) -> None:
+    """墨消し領域が変更対象以外の文字spanと交差しないことを確認する。"""
     for block in page.get_text("dict").get("blocks", []):
         for line in block.get("lines", []):
             for span in line.get("spans", []):
-                span_rect = target_rect.__class__(span["bbox"])
-                if span_rect.intersects(target_rect) and span.get("text"):
-                    spans.append(span)
+                span_text = str(span.get("text", ""))
+                if not span_text or span_text == spec.old_text:
+                    continue
+                span_rect = page.rect.__class__(span["bbox"])
+                if any(layer.rect.intersects(span_rect) for layer in layers):
+                    raise ReplacementError(
+                        "変更対象以外の文字を削除する可能性があるため、処理を中止しました。",
+                        f"処理対象：{spec.label}／交差文字列：{span_text}",
+                    )
 
-    joined_text = "".join(span["text"] for span in spans)
-    if not spans or joined_text != spec.old_text:
+
+def get_original_text_style(
+    page: Any, search_group: SearchGroup, spec: ReplacementSpec
+) -> tuple[TextStyle, tuple[Any, ...]]:
+    """重複レイヤーを調査し、代表書式と最小削除矩形を取得する。"""
+    layers = _matching_text_layers(page, spec)
+    if not layers:
         raise ReplacementError(
             "元の文字書式を取得できませんでした。",
             f"処理対象：{spec.label}",
         )
-
-    first = spans[0]
-    style_keys = ("font", "size", "color", "flags")
-    if any(any(span.get(key) != first.get(key) for key in style_keys) for span in spans):
+    layer_groups = group_overlapping_rectangles(tuple(layer.rect for layer in layers))
+    if len(layer_groups) != 1:
         raise ReplacementError(
-            "対象文字列が異なる書式のspanに分割されています。",
+            "対象文字列の内部レイヤーが異なる表示位置に存在します。",
+            f"処理対象：{spec.label}／レイヤーグループ数：{len(layer_groups)}件",
+        )
+    # rawdictの文字レイヤーもsearch_for()の唯一の表示グループと重なる必要がある。
+    if overlap_ratio(layer_groups[0].union_rect, search_group.union_rect) <= 0:
+        raise ReplacementError(
+            "検索結果と内部文字レイヤーの位置が一致しません。",
             f"処理対象：{spec.label}",
         )
-
-    print(f"検索座標：{tuple(target_rect)}")
-    for number, span in enumerate(spans, start=1):
-        print(f"span {number} 文字列：{span.get('text')}")
-        print(f"span {number} フォント名：{span.get('font')}")
-        print(f"span {number} フォントサイズ：{span.get('size')}")
-        print(f"span {number} 文字色：{span.get('color')}")
-        print(f"span {number} flags：{span.get('flags')}")
-        print(f"span {number} bbox：{span.get('bbox')}")
-        print(f"span {number} origin：{span.get('origin')}")
+    _ensure_deletion_rectangles_are_safe(page, layers, spec)
+    representative = _choose_representative_layer(layers)
+    print(f"内部文字レイヤー数：{len(layers)}件")
+    for number, layer in enumerate(layers, start=1):
+        print(f"layer {number} 文字列：{layer.text}")
+        print(f"layer {number} フォント名：{layer.font}")
+        print(f"layer {number} フォントサイズ：{layer.size}")
+        print(f"layer {number} 文字色：{layer.color}")
+        print(f"layer {number} flags：{layer.flags}")
+        print(f"layer {number} bbox：{tuple(layer.rect)}")
+        print(f"layer {number} origin：{layer.origin}")
+    print(f"代表フォント：{representative.font}")
     print()
-
-    return TextStyle(
-        bbox=target_rect,
-        origin=(float(target_rect.x0), float(first["origin"][1])),
-        font=str(first["font"]),
-        size=float(first["size"]),
-        color=int(first["color"]),
-        flags=int(first["flags"]),
-        ascender=first.get("ascender"),
-        descender=first.get("descender"),
+    style = TextStyle(
+        bbox=layer_groups[0].union_rect,
+        origin=representative.origin,
+        font=representative.font,
+        size=representative.size,
+        color=representative.color,
+        flags=representative.flags,
+        ascender=representative.ascender,
+        descender=representative.descender,
     )
+    return style, tuple(layer.rect for layer in layers)
 
 
 def _font_candidates(is_bold: bool) -> tuple[str, ...]:
@@ -343,8 +496,8 @@ def prepare_replacements(pymupdf: Any, doc: Any) -> tuple[PreparedReplacement, .
     prepared: list[PreparedReplacement] = []
     for spec in REPLACEMENTS:
         page = doc[spec.page_index]
-        target_rect = find_target_text(page, spec)
-        style = get_original_text_style(page, target_rect, spec)
+        search_group = find_target_text(page, spec)
+        style, deletion_rectangles = get_original_text_style(page, search_group, spec)
         ensure_text_only_redaction_supported(pymupdf, page)
         font_path = find_japanese_font(style, spec)
         font_size, changed_rect = calculate_placement(
@@ -354,14 +507,24 @@ def prepare_replacements(pymupdf: Any, doc: Any) -> tuple[PreparedReplacement, .
         print(f"変更後文字列：{spec.new_text}")
         print(f"挿入文字サイズ：{font_size}\n")
         prepared.append(
-            PreparedReplacement(spec, style, font_path, font_size, changed_rect)
+            PreparedReplacement(
+                spec,
+                style,
+                font_path,
+                font_size,
+                changed_rect,
+                deletion_rectangles,
+            )
         )
     return tuple(prepared)
 
 
-def remove_original_text(pymupdf: Any, page: Any, target_rect: Any) -> None:
-    """画像・図形・背景色を変えず、対象矩形内の文字だけを削除する。"""
-    page.add_redact_annot(target_rect, fill=False, cross_out=False)
+def remove_original_text(
+    pymupdf: Any, page: Any, target_rectangles: Sequence[Any]
+) -> None:
+    """画像・図形・背景色を変えず、全重複レイヤーの文字だけを削除する。"""
+    for target_rect in target_rectangles:
+        page.add_redact_annot(target_rect, fill=False, cross_out=False)
     applied = page.apply_redactions(
         images=pymupdf.PDF_REDACT_IMAGE_NONE,
         graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
@@ -408,7 +571,7 @@ def apply_replacements(pymupdf: Any, doc: Any, prepared: Sequence[PreparedReplac
     """検査済みの2件だけを削除・挿入する。"""
     for font_number, item in enumerate(prepared, start=1):
         page = doc[item.spec.page_index]
-        remove_original_text(pymupdf, page, item.style.bbox)
+        remove_original_text(pymupdf, page, item.deletion_rectangles)
         insert_replacement_text(pymupdf, page, item, font_number)
 
 
@@ -517,10 +680,14 @@ def validate_output_pdf(
 
         for spec in REPLACEMENTS:
             page = output_doc[spec.page_index]
-            if len(page.search_for(spec.new_text)) != 1:
+            new_rectangles = tuple(page.search_for(spec.new_text))
+            new_groups = group_overlapping_rectangles(new_rectangles)
+            if len(new_groups) != 1:
                 raise ReplacementError(
                     "保存後の検証に失敗しました。",
-                    f"{spec.label}の変更後文字列が1件ではありません。",
+                    f"{spec.label}の変更後文字列が見た目上1箇所ではありません。"
+                    f"（生の検出件数：{len(new_rectangles)}件／"
+                    f"表示グループ数：{len(new_groups)}件）",
                 )
             if page.search_for(spec.old_text):
                 raise ReplacementError(
@@ -533,6 +700,13 @@ def validate_output_pdf(
                 "保存後の検証に失敗しました。",
                 f"維持する文字列「{REQUIRED_WEEKLY_TEXT}」が見つかりません。",
             )
+        reception_page = output_doc[RECEPTION_START_PAGE_INDEX]
+        for required_text in REQUIRED_RECEPTION_TEXTS:
+            if not reception_page.search_for(required_text):
+                raise ReplacementError(
+                    "保存後の検証に失敗しました。",
+                    f"維持する文字列「{required_text}」が見つかりません。",
+                )
 
         edited_pages = {spec.page_index for spec in REPLACEMENTS}
         for index, original_text in enumerate(snapshot.page_texts):
