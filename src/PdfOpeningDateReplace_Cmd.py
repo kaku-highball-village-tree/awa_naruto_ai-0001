@@ -545,16 +545,24 @@ def find_japanese_font(style: TextStyle, spec: ReplacementSpec) -> Path:
 
 def _span_rectangles(
     page: Any, excluded_rect: Any, ignored_texts: Sequence[str] = ()
-) -> list[Any]:
-    """置換対象以外の文字span矩形を返す。"""
-    rectangles: list[Any] = []
+) -> list[tuple[Any, str]]:
+    """置換対象・移動予定行以外の文字span矩形と文字列を返す。"""
+    rectangles: list[tuple[Any, str]] = []
+    normalized_ignored_texts = {
+        normalize_whitespace_for_comparison(text) for text in ignored_texts
+    }
     for block in page.get_text("dict").get("blocks", []):
         for line in block.get("lines", []):
             for span in line.get("spans", []):
                 rect = excluded_rect.__class__(span["bbox"])
                 text = str(span.get("text", ""))
-                if text and text not in ignored_texts and not rect.intersects(excluded_rect):
-                    rectangles.append(rect)
+                normalized_text = normalize_whitespace_for_comparison(text)
+                if (
+                    normalized_text
+                    and normalized_text not in normalized_ignored_texts
+                    and not rect.intersects(excluded_rect)
+                ):
+                    rectangles.append((rect, text))
     return rectangles
 
 
@@ -585,7 +593,8 @@ def calculate_placement(
         raise ReplacementError("日本語フォントを読み込めませんでした。", str(exc)) from exc
 
     ignored_texts = GENERAL_MOVABLE_TEXTS if len(spec.new_lines) > 1 else ()
-    other_rectangles = _span_rectangles(page, style.bbox, ignored_texts)
+    other_spans = _span_rectangles(page, style.bbox, ignored_texts)
+    last_failure = ""
     for step in range(0, 6):
         font_size = style.size * (1.0 - step / 100.0)
         if font_size < style.size * (1.0 - MAX_FONT_REDUCTION_RATIO):
@@ -609,20 +618,24 @@ def calculate_placement(
         for line_rect in line_rectangles[1:]:
             changed_rect |= line_rect
         if not page.rect.contains(changed_rect):
+            last_failure = "ページ領域からはみ出します。"
             continue
         if _crosses_new_graphics(page, style.bbox, changed_rect):
+            last_failure = "元位置では接していない背景線または図形と重なります。"
             continue
-        if any(
-            rect.intersects(line_rect)
-            for rect in other_rectangles
-            for line_rect in line_rectangles
-        ):
+        colliding_texts = [
+            text
+            for rect, text in other_spans
+            if any(rect.intersects(line_rect) for line_rect in line_rectangles)
+        ]
+        if colliding_texts:
+            last_failure = f"交差文字列：{' / '.join(colliding_texts)}"
             continue
         return font_size, changed_rect | style.bbox, line_advance
 
     raise ReplacementError(
         "変更後文字列を元の位置へ安全に配置できません。",
-        f"処理対象：{spec.label}。周囲の文字、またはページ領域と重なります。",
+        f"処理対象：{spec.label}。{last_failure or '配置条件を満たしません。'}",
     )
 
 
@@ -715,6 +728,9 @@ def prepare_following_line_moves(
     moves: list[PreparedMove] = []
     ignored_texts = set(GENERAL_MOVABLE_TEXTS)
     ignored_texts.update(spec.old_text for spec in REPLACEMENTS)
+    normalized_ignored_texts = {
+        normalize_whitespace_for_comparison(text) for text in ignored_texts
+    }
     for text in GENERAL_MOVABLE_TEXTS:
         group = _find_closest_group_below(page, text, schedule.style.bbox)
         move_spec = ReplacementSpec(f"一般コース後続行「{text}」", 2, text, (text,))
@@ -740,7 +756,11 @@ def prepare_following_line_moves(
             for line in block.get("lines", []):
                 for span in line.get("spans", []):
                     span_text = str(span.get("text", ""))
-                    if not span_text or span_text in ignored_texts:
+                    normalized_span_text = normalize_whitespace_for_comparison(span_text)
+                    if (
+                        not normalized_span_text
+                        or normalized_span_text in normalized_ignored_texts
+                    ):
                         continue
                     span_rect = page.rect.__class__(span["bbox"])
                     if new_rect.intersects(span_rect):
