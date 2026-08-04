@@ -26,8 +26,22 @@ OUTPUT_PDF_NAME = "阿波なるとAI塾_PR_ver2_開講日変更後.pdf"
 ERROR_FILE_NAME = "阿波なるとAI塾_PR_ver2_開講日変更後_error.txt"
 
 OPENING_DATE_PAGE_INDEX = 2
-OLD_OPENING_DATE_TEXT = "令和８年８月６日開講"
-NEW_OPENING_DATE_TEXT = "令和８年９月３日開講／令和８年10月８日開講"
+OLD_CHILD_OPENING_DATE_TEXT = "令和８年８月６日開講"
+NEW_CHILD_OPENING_DATE_TEXT = "令和８年９月３日開講／令和８年10月８日開講"
+
+OLD_GENERAL_OPENING_DATE_TEXT = "令和８年９月４日開講"
+NEW_GENERAL_OPENING_DATE_TEXT = "令和８年９月４日開講／令和８年９月18日開講"
+
+OLD_GENERAL_SCHEDULE_TEXT = "第１・第２金曜日　１８：３０～２０：３０"
+NEW_GENERAL_SCHEDULE_LINES = (
+    "第1･第2金曜日 18:30～20:30",
+    "第3･第4金曜日 18:30～20:30",
+)
+GENERAL_MOVABLE_TEXTS = (
+    "全2回：1回2時間",
+    "受講料",
+    "5500円×2回分＝11000円（税込10％）",
+)
 
 RECEPTION_START_PAGE_INDEX = 3
 OLD_RECEPTION_START_TEXT = "令和８年７月１日より受付開始"
@@ -37,6 +51,8 @@ REQUIRED_WEEKLY_TEXT = "毎週木曜日"
 REQUIRED_RECEPTION_TEXTS = ("募集期間", "(各コース開講前まで応募可能)")
 EXPECTED_PAGE_COUNT = 5
 MAX_FONT_REDUCTION_RATIO = 0.05
+MULTILINE_SPACING_RATIO = 1.15
+MULTILINE_MIN_GAP_RATIO = 0.25
 COMPARISON_DPI = 144
 DISPLAY_GROUP_OVERLAP_RATIO = 0.8
 
@@ -57,7 +73,12 @@ class ReplacementSpec:
     label: str
     page_index: int
     old_text: str
-    new_text: str
+    new_lines: tuple[str, ...]
+
+    @property
+    def new_text(self) -> str:
+        """ログとエラー情報向けに変更後文字列を改行付きで返す。"""
+        return "\n".join(self.new_lines)
 
 
 @dataclass(frozen=True)
@@ -107,6 +128,20 @@ class PreparedReplacement:
     font_size: float
     changed_rect: Any
     deletion_rectangles: tuple[Any, ...]
+    line_advance: float
+
+
+@dataclass(frozen=True)
+class PreparedMove:
+    """一般コース欄内で必要な場合だけ下へ移動する既存行。"""
+
+    text: str
+    page_index: int
+    style: TextStyle
+    font_path: Path
+    deletion_rectangles: tuple[Any, ...]
+    y_offset: float
+    changed_rect: Any
 
 
 @dataclass(frozen=True)
@@ -124,14 +159,26 @@ REPLACEMENTS = (
     ReplacementSpec(
         "児童コース開講日",
         OPENING_DATE_PAGE_INDEX,
-        OLD_OPENING_DATE_TEXT,
-        NEW_OPENING_DATE_TEXT,
+        OLD_CHILD_OPENING_DATE_TEXT,
+        (NEW_CHILD_OPENING_DATE_TEXT,),
+    ),
+    ReplacementSpec(
+        "一般コース開講日",
+        OPENING_DATE_PAGE_INDEX,
+        OLD_GENERAL_OPENING_DATE_TEXT,
+        (NEW_GENERAL_OPENING_DATE_TEXT,),
+    ),
+    ReplacementSpec(
+        "一般コース受講日時",
+        OPENING_DATE_PAGE_INDEX,
+        OLD_GENERAL_SCHEDULE_TEXT,
+        NEW_GENERAL_SCHEDULE_LINES,
     ),
     ReplacementSpec(
         "受付開始日",
         RECEPTION_START_PAGE_INDEX,
         OLD_RECEPTION_START_TEXT,
-        NEW_RECEPTION_START_TEXT,
+        (NEW_RECEPTION_START_TEXT,),
     ),
 )
 
@@ -355,7 +402,11 @@ def get_original_text_style(
     page: Any, search_group: SearchGroup, spec: ReplacementSpec
 ) -> tuple[TextStyle, tuple[Any, ...]]:
     """重複レイヤーを調査し、代表書式と最小削除矩形を取得する。"""
-    layers = _matching_text_layers(page, spec)
+    layers = tuple(
+        layer
+        for layer in _matching_text_layers(page, spec)
+        if overlap_ratio(layer.rect, search_group.union_rect) > 0
+    )
     if not layers:
         raise ReplacementError(
             "元の文字書式を取得できませんでした。",
@@ -425,16 +476,32 @@ def find_japanese_font(style: TextStyle, spec: ReplacementSpec) -> Path:
     )
 
 
-def _span_rectangles(page: Any, excluded_rect: Any) -> list[Any]:
+def _span_rectangles(
+    page: Any, excluded_rect: Any, ignored_texts: Sequence[str] = ()
+) -> list[Any]:
     """置換対象以外の文字span矩形を返す。"""
     rectangles: list[Any] = []
     for block in page.get_text("dict").get("blocks", []):
         for line in block.get("lines", []):
             for span in line.get("spans", []):
                 rect = excluded_rect.__class__(span["bbox"])
-                if span.get("text") and not rect.intersects(excluded_rect):
+                text = str(span.get("text", ""))
+                if text and text not in ignored_texts and not rect.intersects(excluded_rect):
                     rectangles.append(rect)
     return rectangles
+
+
+def _crosses_new_graphics(page: Any, old_rect: Any, new_rect: Any) -> bool:
+    """元位置では触れていない背景線・図形へ新配置が侵入するか確認する。"""
+    for drawing in page.get_drawings():
+        drawing_rect = drawing.get("rect")
+        if (
+            drawing_rect is not None
+            and new_rect.intersects(drawing_rect)
+            and not old_rect.intersects(drawing_rect)
+        ):
+            return True
+    return False
 
 
 def calculate_placement(
@@ -443,29 +510,48 @@ def calculate_placement(
     style: TextStyle,
     font_path: Path,
     spec: ReplacementSpec,
-) -> tuple[float, Any]:
-    """最大5%の縮小範囲で、他の文字と重ならない配置を検証する。"""
+) -> tuple[float, Any, float]:
+    """最大5%縮小し、1行または狭い行間の2行配置を検証する。"""
     try:
         font = pymupdf.Font(fontfile=str(font_path))
     except Exception as exc:
         raise ReplacementError("日本語フォントを読み込めませんでした。", str(exc)) from exc
 
-    other_rectangles = _span_rectangles(page, style.bbox)
+    ignored_texts = GENERAL_MOVABLE_TEXTS if len(spec.new_lines) > 1 else ()
+    other_rectangles = _span_rectangles(page, style.bbox, ignored_texts)
     for step in range(0, 6):
         font_size = style.size * (1.0 - step / 100.0)
         if font_size < style.size * (1.0 - MAX_FONT_REDUCTION_RATIO):
             break
-        width = font.text_length(spec.new_text, fontsize=font_size)
         top = style.origin[1] - font_size * (style.ascender or 1.0)
         bottom = style.origin[1] - font_size * (style.descender or -0.25)
-        changed_rect = pymupdf.Rect(
-            style.origin[0], min(top, bottom), style.origin[0] + width, max(top, bottom)
-        )
+        line_advance = font_size * MULTILINE_SPACING_RATIO if len(spec.new_lines) > 1 else 0.0
+        line_rectangles = []
+        for line_number, line_text in enumerate(spec.new_lines):
+            width = font.text_length(line_text, fontsize=font_size)
+            y_offset = line_number * line_advance
+            line_rectangles.append(
+                pymupdf.Rect(
+                    style.origin[0],
+                    min(top, bottom) + y_offset,
+                    style.origin[0] + width,
+                    max(top, bottom) + y_offset,
+                )
+            )
+        changed_rect = line_rectangles[0]
+        for line_rect in line_rectangles[1:]:
+            changed_rect |= line_rect
         if not page.rect.contains(changed_rect):
             continue
-        if any(rect.intersects(changed_rect) for rect in other_rectangles):
+        if _crosses_new_graphics(page, style.bbox, changed_rect):
             continue
-        return font_size, changed_rect | style.bbox
+        if any(
+            rect.intersects(line_rect)
+            for rect in other_rectangles
+            for line_rect in line_rectangles
+        ):
+            continue
+        return font_size, changed_rect | style.bbox, line_advance
 
     raise ReplacementError(
         "変更後文字列を元の位置へ安全に配置できません。",
@@ -492,7 +578,7 @@ def ensure_text_only_redaction_supported(pymupdf: Any, page: Any) -> None:
 
 
 def prepare_replacements(pymupdf: Any, doc: Any) -> tuple[PreparedReplacement, ...]:
-    """2件すべてを編集前に検査し、部分的な変更を防ぐ。"""
+    """4件すべてを編集前に検査し、部分的な変更を防ぐ。"""
     prepared: list[PreparedReplacement] = []
     for spec in REPLACEMENTS:
         page = doc[spec.page_index]
@@ -500,7 +586,7 @@ def prepare_replacements(pymupdf: Any, doc: Any) -> tuple[PreparedReplacement, .
         style, deletion_rectangles = get_original_text_style(page, search_group, spec)
         ensure_text_only_redaction_supported(pymupdf, page)
         font_path = find_japanese_font(style, spec)
-        font_size, changed_rect = calculate_placement(
+        font_size, changed_rect, line_advance = calculate_placement(
             pymupdf, page, style, font_path, spec
         )
         print(f"使用フォント：{font_path}")
@@ -514,9 +600,100 @@ def prepare_replacements(pymupdf: Any, doc: Any) -> tuple[PreparedReplacement, .
                 font_size,
                 changed_rect,
                 deletion_rectangles,
+                line_advance,
             )
         )
     return tuple(prepared)
+
+
+def _find_closest_group_below(page: Any, text: str, reference_rect: Any) -> SearchGroup:
+    """同じ文字が複数欄にあっても、一般コース対象の直下を安全に選ぶ。"""
+    rectangles = tuple(page.search_for(text))
+    groups = group_overlapping_rectangles(rectangles)
+    candidates = [group for group in groups if group.union_rect.y0 >= reference_rect.y0]
+    if not candidates:
+        raise ReplacementError(
+            "移動対象の後続行が見つかりませんでした。", f"検索文字列：{text}"
+        )
+    candidates.sort(key=lambda group: group.union_rect.y0)
+    if len(candidates) > 1 and abs(
+        candidates[0].union_rect.y0 - candidates[1].union_rect.y0
+    ) < 1.0:
+        raise ReplacementError(
+            "移動対象を一意に特定できませんでした。", f"検索文字列：{text}"
+        )
+    return candidates[0]
+
+
+def prepare_following_line_moves(
+    pymupdf: Any,
+    doc: Any,
+    replacements: Sequence[PreparedReplacement],
+) -> tuple[PreparedMove, ...]:
+    """2行目と重なる場合だけ、一般コースの後続行を同量だけ下へ移動する。"""
+    schedule = next(
+        item for item in replacements if item.spec.old_text == OLD_GENERAL_SCHEDULE_TEXT
+    )
+    page = doc[schedule.spec.page_index]
+    first_group = _find_closest_group_below(
+        page, GENERAL_MOVABLE_TEXTS[0], schedule.style.bbox
+    )
+    required_top = schedule.changed_rect.y1 + (
+        schedule.font_size * MULTILINE_MIN_GAP_RATIO
+    )
+    y_offset = max(0.0, required_top - first_group.union_rect.y0)
+    if y_offset <= 0:
+        return ()
+
+    moves: list[PreparedMove] = []
+    ignored_texts = set(GENERAL_MOVABLE_TEXTS)
+    ignored_texts.update(spec.old_text for spec in REPLACEMENTS)
+    for text in GENERAL_MOVABLE_TEXTS:
+        group = _find_closest_group_below(page, text, schedule.style.bbox)
+        move_spec = ReplacementSpec(f"一般コース後続行「{text}」", 2, text, (text,))
+        style, deletion_rectangles = get_original_text_style(page, group, move_spec)
+        font_path = find_japanese_font(style, move_spec)
+        new_rect = style.bbox.__class__(
+            style.bbox.x0,
+            style.bbox.y0 + y_offset,
+            style.bbox.x1,
+            style.bbox.y1 + y_offset,
+        )
+        if not page.rect.contains(new_rect):
+            raise ReplacementError(
+                "一般コースの後続行を欄内へ移動できません。",
+                f"移動対象：{text}",
+            )
+        if _crosses_new_graphics(page, style.bbox, new_rect):
+            raise ReplacementError(
+                "一般コースの後続行が背景線または図形へ重なるため移動できません。",
+                f"移動対象：{text}",
+            )
+        for block in page.get_text("dict").get("blocks", []):
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    span_text = str(span.get("text", ""))
+                    if not span_text or span_text in ignored_texts:
+                        continue
+                    span_rect = page.rect.__class__(span["bbox"])
+                    if new_rect.intersects(span_rect):
+                        raise ReplacementError(
+                            "一般コースの後続行を安全に移動できません。",
+                            f"移動対象：{text}／交差文字列：{span_text}",
+                        )
+        moves.append(
+            PreparedMove(
+                text,
+                schedule.spec.page_index,
+                style,
+                font_path,
+                deletion_rectangles,
+                y_offset,
+                style.bbox | new_rect,
+            )
+        )
+    print(f"一般コース後続行のY方向移動量：{y_offset}")
+    return tuple(moves)
 
 
 def remove_original_text(
@@ -547,32 +724,76 @@ def insert_replacement_text(
     font_alias = f"replacement_japanese_font_{font_number}"
     try:
         page.insert_font(fontname=font_alias, fontfile=str(prepared.font_path))
-        result = page.insert_text(
-            prepared.style.origin,
-            prepared.spec.new_text,
-            fontsize=prepared.font_size,
-            fontname=font_alias,
-            color=_pdf_color(pymupdf, prepared.style.color),
-            overlay=True,
-        )
+        results = []
+        for line_number, line_text in enumerate(prepared.spec.new_lines):
+            origin = (
+                prepared.style.origin[0],
+                prepared.style.origin[1] + line_number * prepared.line_advance,
+            )
+            results.append(
+                page.insert_text(
+                    origin,
+                    line_text,
+                    fontsize=prepared.font_size,
+                    fontname=font_alias,
+                    color=_pdf_color(pymupdf, prepared.style.color),
+                    overlay=True,
+                )
+            )
     except Exception as exc:
         raise ReplacementError(
             "新しい文字列を書き込めませんでした。",
             f"処理対象：{prepared.spec.label}／詳細：{exc}",
         ) from exc
-    if result < 0:
+    if any(result < 0 for result in results):
         raise ReplacementError(
             "新しい文字列を書き込めませんでした。",
             f"処理対象：{prepared.spec.label}",
         )
 
 
-def apply_replacements(pymupdf: Any, doc: Any, prepared: Sequence[PreparedReplacement]) -> None:
-    """検査済みの2件だけを削除・挿入する。"""
+def insert_moved_text(
+    pymupdf: Any, page: Any, move: PreparedMove, font_number: int
+) -> None:
+    """後続行の内容と書式を変えず、必要最小限だけ下へ再配置する。"""
+    alias = f"moved_japanese_font_{font_number}"
+    try:
+        page.insert_font(fontname=alias, fontfile=str(move.font_path))
+        result = page.insert_text(
+            (move.style.origin[0], move.style.origin[1] + move.y_offset),
+            move.text,
+            fontsize=move.style.size,
+            fontname=alias,
+            color=_pdf_color(pymupdf, move.style.color),
+            overlay=True,
+        )
+    except Exception as exc:
+        raise ReplacementError(
+            "一般コースの後続行を移動できませんでした。",
+            f"移動対象：{move.text}／詳細：{exc}",
+        ) from exc
+    if result < 0:
+        raise ReplacementError(
+            "一般コースの後続行を移動できませんでした。",
+            f"移動対象：{move.text}",
+        )
+
+
+def apply_replacements(
+    pymupdf: Any,
+    doc: Any,
+    prepared: Sequence[PreparedReplacement],
+    moves: Sequence[PreparedMove],
+) -> None:
+    """検査済みの4件を置換し、必要な場合だけ後続行を移動する。"""
     for font_number, item in enumerate(prepared, start=1):
         page = doc[item.spec.page_index]
         remove_original_text(pymupdf, page, item.deletion_rectangles)
         insert_replacement_text(pymupdf, page, item, font_number)
+    for font_number, move in enumerate(moves, start=1):
+        page = doc[move.page_index]
+        remove_original_text(pymupdf, page, move.deletion_rectangles)
+        insert_moved_text(pymupdf, page, move, font_number)
 
 
 def _render_hash(page: Any) -> str:
@@ -608,12 +829,12 @@ def snapshot_document(doc: Any) -> DocumentSnapshot:
     return DocumentSnapshot(doc.page_count, sizes, texts, hashes, tuple(renderings))
 
 
-def _validate_edited_page_outside_rect(
+def _validate_edited_page_outside_rectangles(
     page: Any,
     original: tuple[int, int, int, int, int, bytes],
-    allowed_rect: Any,
+    allowed_rectangles: Sequence[Any],
 ) -> None:
-    """編集対象矩形の外側に視覚的な変化がないことを確認する。"""
+    """複数の編集対象矩形の外側に視覚的な変化がないことを確認する。"""
     _, width, height, components, stride, original_samples = original
     pixmap = page.get_pixmap(alpha=False)
     if (pixmap.width, pixmap.height, pixmap.n, pixmap.stride) != (
@@ -626,33 +847,55 @@ def _validate_edited_page_outside_rect(
             "保存後の検証に失敗しました。", "編集ページの描画サイズが変わっています。"
         )
 
-    # アンチエイリアスの端を含めるため、許可矩形へ2ピクセルの余白を設ける。
-    left = max(0, int(allowed_rect.x0) - 2)
-    top = max(0, int(allowed_rect.y0) - 2)
-    right = min(width, int(allowed_rect.x1 + 0.9999) + 2)
-    bottom = min(height, int(allowed_rect.y1 + 0.9999) + 2)
     current_samples = pixmap.samples
-    left_bytes = left * components
-    right_bytes = right * components
     for y in range(height):
         row_start = y * stride
         row_end = row_start + stride
-        if top <= y < bottom:
-            if (
-                original_samples[row_start : row_start + left_bytes]
-                != current_samples[row_start : row_start + left_bytes]
-                or original_samples[row_start + right_bytes : row_end]
-                != current_samples[row_start + right_bytes : row_end]
-            ):
+        intervals = []
+        for rectangle in allowed_rectangles:
+            top = max(0, int(rectangle.y0) - 2)
+            bottom = min(height, int(rectangle.y1 + 0.9999) + 2)
+            if top <= y < bottom:
+                intervals.append(
+                    (
+                        max(0, int(rectangle.x0) - 2),
+                        min(width, int(rectangle.x1 + 0.9999) + 2),
+                    )
+                )
+        intervals.sort()
+        merged: list[tuple[int, int]] = []
+        for left, right in intervals:
+            if merged and left <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], right))
+            else:
+                merged.append((left, right))
+        cursor = 0
+        for left, right in merged:
+            start = row_start + cursor * components
+            end = row_start + left * components
+            if original_samples[start:end] != current_samples[start:end]:
                 raise ReplacementError(
                     "保存後の検証に失敗しました。",
                     "指定された文字列の矩形外で見た目が変わっています。",
                 )
-        elif original_samples[row_start:row_end] != current_samples[row_start:row_end]:
+            cursor = max(cursor, right)
+        tail_start = row_start + cursor * components
+        if original_samples[tail_start:row_end] != current_samples[tail_start:row_end]:
             raise ReplacementError(
                 "保存後の検証に失敗しました。",
                 "指定された文字列の矩形外で見た目が変わっています。",
             )
+
+
+def _has_standalone_text_layer(page: Any, text: str) -> bool:
+    """別文字列の一部ではなく、単独spanとして旧文字列が残っているか確認する。"""
+    for block in page.get_text("rawdict").get("blocks", []):
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                span_text = "".join(char.get("c", "") for char in span.get("chars", []))
+                if span_text == text:
+                    return True
+    return False
 
 
 def validate_output_pdf(
@@ -660,6 +903,7 @@ def validate_output_pdf(
     output_path: Path,
     snapshot: DocumentSnapshot,
     prepared: Sequence[PreparedReplacement],
+    moves: Sequence[PreparedMove],
 ) -> None:
     """保存PDFを開き直し、置換結果と対象外ページを検証する。"""
     try:
@@ -680,19 +924,46 @@ def validate_output_pdf(
 
         for spec in REPLACEMENTS:
             page = output_doc[spec.page_index]
-            new_rectangles = tuple(page.search_for(spec.new_text))
-            new_groups = group_overlapping_rectangles(new_rectangles)
-            if len(new_groups) != 1:
-                raise ReplacementError(
-                    "保存後の検証に失敗しました。",
-                    f"{spec.label}の変更後文字列が見た目上1箇所ではありません。"
-                    f"（生の検出件数：{len(new_rectangles)}件／"
-                    f"表示グループ数：{len(new_groups)}件）",
-                )
-            if page.search_for(spec.old_text):
+            for line_number, new_line in enumerate(spec.new_lines, start=1):
+                new_rectangles = tuple(page.search_for(new_line))
+                new_groups = group_overlapping_rectangles(new_rectangles)
+                if len(new_groups) != 1:
+                    raise ReplacementError(
+                        "保存後の検証に失敗しました。",
+                        f"{spec.label}の{line_number}行目が見た目上1箇所ではありません。"
+                        f"（生の検出件数：{len(new_rectangles)}件／"
+                        f"表示グループ数：{len(new_groups)}件）",
+                    )
+            old_is_contained = any(spec.old_text in line for line in spec.new_lines)
+            old_remains = (
+                _has_standalone_text_layer(page, spec.old_text)
+                if old_is_contained
+                else bool(page.search_for(spec.old_text))
+            )
+            if old_remains:
                 raise ReplacementError(
                     "保存後の検証に失敗しました。",
                     f"{spec.label}の変更前文字列が残っています。",
+                )
+
+        for move in moves:
+            page = output_doc[move.page_index]
+            groups = group_overlapping_rectangles(tuple(page.search_for(move.text)))
+            expected_rect = move.style.bbox.__class__(
+                move.style.bbox.x0,
+                move.style.bbox.y0 + move.y_offset,
+                move.style.bbox.x1,
+                move.style.bbox.y1 + move.y_offset,
+            )
+            matching_groups = [
+                group
+                for group in groups
+                if overlap_ratio(group.union_rect, expected_rect) > 0
+            ]
+            if len(matching_groups) != 1:
+                raise ReplacementError(
+                    "保存後の検証に失敗しました。",
+                    f"移動後の文字列「{move.text}」を確認できません。",
                 )
 
         if not output_doc[OPENING_DATE_PAGE_INDEX].search_for(REQUIRED_WEEKLY_TEXT):
@@ -722,11 +993,16 @@ def validate_output_pdf(
                     f"{index + 1}ページ目の見た目が変わっています。",
                 )
         rendering_by_page = {item[0]: item for item in snapshot.edited_renderings}
+        allowed_by_page: dict[int, list[Any]] = {}
         for item in prepared:
-            _validate_edited_page_outside_rect(
-                output_doc[item.spec.page_index],
-                rendering_by_page[item.spec.page_index],
-                item.changed_rect,
+            allowed_by_page.setdefault(item.spec.page_index, []).append(item.changed_rect)
+        for move in moves:
+            allowed_by_page.setdefault(move.page_index, []).append(move.changed_rect)
+        for page_index, allowed_rectangles in allowed_by_page.items():
+            _validate_edited_page_outside_rectangles(
+                output_doc[page_index],
+                rendering_by_page[page_index],
+                allowed_rectangles,
             )
     finally:
         output_doc.close()
@@ -738,6 +1014,7 @@ def save_and_validate(
     output_path: Path,
     snapshot: DocumentSnapshot,
     prepared: Sequence[PreparedReplacement],
+    moves: Sequence[PreparedMove],
 ) -> None:
     """最適化せず一時保存し、検証成功後だけ正式名へ変更する。"""
     temporary_path = output_path.with_name(
@@ -745,7 +1022,7 @@ def save_and_validate(
     )
     try:
         doc.save(temporary_path)
-        validate_output_pdf(pymupdf, temporary_path, snapshot, prepared)
+        validate_output_pdf(pymupdf, temporary_path, snapshot, prepared, moves)
         temporary_path.replace(output_path)
     except ReplacementError:
         raise
@@ -777,17 +1054,24 @@ def write_error_file(program_dir: Path, error: ReplacementError) -> Path | None:
     """既存ファイルを上書きせず、日本語のエラー情報を保存する。"""
     try:
         error_path = find_available_path(program_dir / ERROR_FILE_NAME)
-        lines = (
+        lines = [
             "処理結果：エラー",
             f"入力PDF：{INPUT_PDF_NAME}",
             "対象ページ：3ページ目、4ページ目",
-            f"開講日検索文字列：{OLD_OPENING_DATE_TEXT}",
-            f"開講日変更後文字列：{NEW_OPENING_DATE_TEXT}",
-            f"受付開始日検索文字列：{OLD_RECEPTION_START_TEXT}",
-            f"受付開始日変更後文字列：{NEW_RECEPTION_START_TEXT}",
-            f"エラー内容：{error.message}",
-            f"詳細：{error.detail or 'なし'}",
-            f"発生日時：{datetime.now().astimezone().isoformat(timespec='seconds')}",
+        ]
+        for replacement in REPLACEMENTS:
+            lines.extend(
+                (
+                    f"{replacement.label}検索文字列：{replacement.old_text}",
+                    f"{replacement.label}変更後文字列：{replacement.new_text}",
+                )
+            )
+        lines.extend(
+            (
+                f"エラー内容：{error.message}",
+                f"詳細：{error.detail or 'なし'}",
+                f"発生日時：{datetime.now().astimezone().isoformat(timespec='seconds')}",
+            )
         )
         error_path.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
         return error_path
@@ -797,7 +1081,7 @@ def write_error_file(program_dir: Path, error: ReplacementError) -> Path | None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """2箇所の日付差し替えを安全に実行する。"""
+    """4箇所の文字列差し替えを安全に実行する。"""
     args = parse_arguments(argv)
     program_dir = Path(__file__).resolve().parent
     doc: Any | None = None
@@ -809,10 +1093,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"入力PDF：{input_path.name}")
         doc = open_pdf(pymupdf, input_path)
         prepared = prepare_replacements(pymupdf, doc)
+        moves = prepare_following_line_moves(pymupdf, doc, prepared)
         snapshot = snapshot_document(doc)
 
-        apply_replacements(pymupdf, doc, prepared)
-        save_and_validate(pymupdf, doc, output_path, snapshot, prepared)
+        apply_replacements(pymupdf, doc, prepared, moves)
+        save_and_validate(pymupdf, doc, output_path, snapshot, prepared, moves)
 
         before_images: tuple[Path, ...] = ()
         after_images: tuple[Path, ...] = ()
