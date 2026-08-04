@@ -321,44 +321,80 @@ def find_target_text(page: Any, spec: ReplacementSpec) -> SearchGroup:
     return groups[0]
 
 
-def _matching_text_layers(page: Any, spec: ReplacementSpec) -> tuple[TextLayer, ...]:
-    """rawdictから旧文字列を構成するレイヤーと最小文字矩形を取得する。"""
+def normalize_whitespace_for_comparison(text: str) -> str:
+    """比較時だけUnicode空白を除去し、全角・半角や記号は維持する。"""
+    return "".join(character for character in text if not character.isspace())
+
+
+def _matching_text_layers(
+    page: Any, spec: ReplacementSpec, search_group: SearchGroup
+) -> tuple[TextLayer, ...]:
+    """同一行の複数spanを連結し、空白を除いて一致するレイヤーを取得する。"""
     layers: list[TextLayer] = []
+    normalized_old_text = normalize_whitespace_for_comparison(spec.old_text)
     for block in page.get_text("rawdict").get("blocks", []):
         for line in block.get("lines", []):
-            for span in line.get("spans", []):
-                characters = span.get("chars", [])
-                span_text = "".join(character.get("c", "") for character in characters)
-                start = 0
-                while True:
-                    match_index = span_text.find(spec.old_text, start)
-                    if match_index < 0:
-                        break
-                    matched_characters = characters[
-                        match_index : match_index + len(spec.old_text)
-                    ]
-                    if len(matched_characters) != len(spec.old_text):
-                        break
-                    rect = page.rect.__class__(matched_characters[0]["bbox"])
-                    for character in matched_characters[1:]:
-                        rect |= page.rect.__class__(character["bbox"])
-                    origin_value = matched_characters[0].get(
-                        "origin", span.get("origin", (rect.x0, rect.y1))
-                    )
-                    layers.append(
-                        TextLayer(
-                            spec.old_text,
-                            rect,
-                            str(span.get("font", "")),
-                            float(span.get("size", 0.0)),
-                            int(span.get("color", 0)),
-                            int(span.get("flags", 0)),
-                            (float(origin_value[0]), float(origin_value[1])),
-                            span.get("ascender"),
-                            span.get("descender"),
-                        )
-                    )
-                    start = match_index + len(spec.old_text)
+            candidates: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            ordered_spans = sorted(
+                line.get("spans", []),
+                key=lambda span: (
+                    round(float(span["bbox"][1]), 1),
+                    float(span["bbox"][0]),
+                ),
+            )
+            for span in ordered_spans:
+                for character in span.get("chars", []):
+                    character_text = str(character.get("c", ""))
+                    character_rect = page.rect.__class__(character["bbox"])
+                    if character_text.isspace() or character_rect.intersects(
+                        search_group.union_rect
+                    ):
+                        candidates.append((character, span))
+            combined_text = "".join(
+                str(character.get("c", "")) for character, _ in candidates
+            )
+            if (
+                not candidates
+                or normalize_whitespace_for_comparison(combined_text)
+                != normalized_old_text
+            ):
+                continue
+
+            visible_candidates = [
+                item
+                for item in candidates
+                if not str(item[0].get("c", "")).isspace()
+            ]
+            if not visible_candidates:
+                continue
+            rect = page.rect.__class__(visible_candidates[0][0]["bbox"])
+            span_counts: dict[int, int] = {}
+            spans_by_id: dict[int, dict[str, Any]] = {}
+            for character, span in visible_candidates:
+                rect |= page.rect.__class__(character["bbox"])
+                span_id = id(span)
+                span_counts[span_id] = span_counts.get(span_id, 0) + 1
+                spans_by_id[span_id] = span
+            representative_span = spans_by_id[
+                max(span_counts, key=lambda span_id: span_counts[span_id])
+            ]
+            first_character = visible_candidates[0][0]
+            origin_value = first_character.get(
+                "origin", representative_span.get("origin", (rect.x0, rect.y1))
+            )
+            layers.append(
+                TextLayer(
+                    spec.old_text,
+                    rect,
+                    str(representative_span.get("font", "")),
+                    float(representative_span.get("size", 0.0)),
+                    int(representative_span.get("color", 0)),
+                    int(representative_span.get("flags", 0)),
+                    (float(origin_value[0]), float(origin_value[1])),
+                    representative_span.get("ascender"),
+                    representative_span.get("descender"),
+                )
+            )
     return tuple(layers)
 
 
@@ -381,21 +417,52 @@ def _choose_representative_layer(layers: Sequence[TextLayer]) -> TextLayer:
 
 
 def _ensure_deletion_rectangles_are_safe(
-    page: Any, layers: Sequence[TextLayer], spec: ReplacementSpec
+    page: Any,
+    layers: Sequence[TextLayer],
+    search_group: SearchGroup,
+    spec: ReplacementSpec,
 ) -> None:
-    """墨消し領域が変更対象以外の文字spanと交差しないことを確認する。"""
+    """交差span群の空白除去後文字列と座標が対象に一致することを確認する。"""
+    normalized_old_text = normalize_whitespace_for_comparison(spec.old_text)
     for block in page.get_text("dict").get("blocks", []):
         for line in block.get("lines", []):
+            intersecting_spans = []
             for span in line.get("spans", []):
                 span_text = str(span.get("text", ""))
-                if not span_text or span_text == spec.old_text:
-                    continue
                 span_rect = page.rect.__class__(span["bbox"])
-                if any(layer.rect.intersects(span_rect) for layer in layers):
-                    raise ReplacementError(
-                        "変更対象以外の文字を削除する可能性があるため、処理を中止しました。",
-                        f"処理対象：{spec.label}／交差文字列：{span_text}",
-                    )
+                if span_text and any(layer.rect.intersects(span_rect) for layer in layers):
+                    intersecting_spans.append((span, span_rect))
+            if not intersecting_spans:
+                continue
+            intersecting_spans.sort(
+                key=lambda item: (
+                    round(float(item[0]["bbox"][1]), 1),
+                    float(item[0]["bbox"][0]),
+                )
+            )
+            normalized_span_texts = [
+                normalize_whitespace_for_comparison(str(span.get("text", "")))
+                for span, _ in intersecting_spans
+            ]
+            combined_text = "".join(
+                str(span.get("text", "")) for span, _ in intersecting_spans
+            )
+            text_matches = (
+                all(text == normalized_old_text for text in normalized_span_texts)
+                or normalize_whitespace_for_comparison(combined_text)
+                == normalized_old_text
+            )
+            combined_rect = page.rect.__class__(intersecting_spans[0][1])
+            for _, span_rect in intersecting_spans[1:]:
+                combined_rect |= span_rect
+            position_matches = (
+                overlap_ratio(combined_rect, search_group.union_rect) >= 0.9
+            )
+            if not text_matches or not position_matches:
+                raise ReplacementError(
+                    "変更対象以外の文字を削除する可能性があるため、処理を中止しました。",
+                    f"処理対象：{spec.label}／交差文字列：{combined_text}",
+                )
 
 
 def get_original_text_style(
@@ -404,8 +471,8 @@ def get_original_text_style(
     """重複レイヤーを調査し、代表書式と最小削除矩形を取得する。"""
     layers = tuple(
         layer
-        for layer in _matching_text_layers(page, spec)
-        if overlap_ratio(layer.rect, search_group.union_rect) > 0
+        for layer in _matching_text_layers(page, spec, search_group)
+        if overlap_ratio(layer.rect, search_group.union_rect) >= 0.9
     )
     if not layers:
         raise ReplacementError(
@@ -424,7 +491,7 @@ def get_original_text_style(
             "検索結果と内部文字レイヤーの位置が一致しません。",
             f"処理対象：{spec.label}",
         )
-    _ensure_deletion_rectangles_are_safe(page, layers, spec)
+    _ensure_deletion_rectangles_are_safe(page, layers, search_group, spec)
     representative = _choose_representative_layer(layers)
     print(f"内部文字レイヤー数：{len(layers)}件")
     for number, layer in enumerate(layers, start=1):
