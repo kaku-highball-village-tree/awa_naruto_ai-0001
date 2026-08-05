@@ -41,7 +41,7 @@ NEW_GENERAL_SCHEDULE_LINES = (
 GENERAL_MOVABLE_TEXTS = (
     "全２回：１回２時間",
     "受講料",
-    "５５００円×２回分＝１１０００円（税込１０％）",
+    "５５００円×２回分＝１１０００円　（税込１０％）",
 )
 
 RECEPTION_START_PAGE_INDEX = 3
