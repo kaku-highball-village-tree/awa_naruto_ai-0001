@@ -38,9 +38,9 @@ NEW_GENERAL_SCHEDULE_LINES = (
     "第3･第4金曜日 18:30～20:30",
 )
 GENERAL_MOVABLE_TEXTS = (
-    "全2回：1回2時間",
+    "全２回：１回２時間",
     "受講料",
-    "5500円×2回分＝11000円（税込10％）",
+    "５５００円×２回分＝１１０００円（税込１０％）",
 )
 
 RECEPTION_START_PAGE_INDEX = 3
@@ -50,8 +50,12 @@ NEW_RECEPTION_START_TEXT = "令和８年８月１日より受付開始"
 REQUIRED_WEEKLY_TEXT = "毎週木曜日"
 REQUIRED_RECEPTION_TEXTS = ("募集期間", "(各コース開講前まで応募可能)")
 EXPECTED_PAGE_COUNT = 5
-MAX_FONT_REDUCTION_RATIO = 0.05
-MULTILINE_SPACING_RATIO = 1.15
+MAX_OTHER_FONT_REDUCTION_RATIO = 0.05
+MAX_SCHEDULE_FONT_REDUCTION_RATIO = 0.10
+MULTILINE_MIN_SPACING_RATIO = 1.15
+MULTILINE_MAX_SPACING_RATIO = 1.30
+MULTILINE_SPACING_STEP = 0.01
+MINIMUM_FOLLOWING_GAP = 4.0
 MULTILINE_MIN_GAP_RATIO = 0.25
 COMPARISON_DPI = 144
 DISPLAY_GROUP_OVERLAP_RATIO = 0.8
@@ -567,15 +571,22 @@ def _span_rectangles(
 
 
 def _crosses_new_graphics(page: Any, old_rect: Any, new_rect: Any) -> bool:
-    """元位置では触れていない背景線・図形へ新配置が侵入するか確認する。"""
+    """新しい図形への侵入と、元の背景領域からのはみ出しを確認する。"""
+    containing_rectangles = []
     for drawing in page.get_drawings():
         drawing_rect = drawing.get("rect")
+        if drawing_rect is not None and drawing_rect.contains(old_rect):
+            containing_rectangles.append(drawing_rect)
         if (
             drawing_rect is not None
             and new_rect.intersects(drawing_rect)
             and not old_rect.intersects(drawing_rect)
         ):
             return True
+    if containing_rectangles and not any(
+        drawing_rect.contains(new_rect) for drawing_rect in containing_rectangles
+    ):
+        return True
     return False
 
 
@@ -586,7 +597,7 @@ def calculate_placement(
     font_path: Path,
     spec: ReplacementSpec,
 ) -> tuple[float, Any, float]:
-    """最大5%縮小し、1行または狭い行間の2行配置を検証する。"""
+    """対象別の最大縮小率と安全な行間で、最大の文字サイズを選ぶ。"""
     try:
         font = pymupdf.Font(fontfile=str(font_path))
     except Exception as exc:
@@ -595,43 +606,68 @@ def calculate_placement(
     ignored_texts = GENERAL_MOVABLE_TEXTS if len(spec.new_lines) > 1 else ()
     other_spans = _span_rectangles(page, style.bbox, ignored_texts)
     last_failure = ""
-    for step in range(0, 6):
-        font_size = style.size * (1.0 - step / 100.0)
-        if font_size < style.size * (1.0 - MAX_FONT_REDUCTION_RATIO):
-            break
-        top = style.origin[1] - font_size * (style.ascender or 1.0)
-        bottom = style.origin[1] - font_size * (style.descender or -0.25)
-        line_advance = font_size * MULTILINE_SPACING_RATIO if len(spec.new_lines) > 1 else 0.0
-        line_rectangles = []
-        for line_number, line_text in enumerate(spec.new_lines):
-            width = font.text_length(line_text, fontsize=font_size)
-            y_offset = line_number * line_advance
-            line_rectangles.append(
-                pymupdf.Rect(
-                    style.origin[0],
-                    min(top, bottom) + y_offset,
-                    style.origin[0] + width,
-                    max(top, bottom) + y_offset,
-                )
-            )
-        changed_rect = line_rectangles[0]
-        for line_rect in line_rectangles[1:]:
-            changed_rect |= line_rect
-        if not page.rect.contains(changed_rect):
-            last_failure = "ページ領域からはみ出します。"
-            continue
-        if _crosses_new_graphics(page, style.bbox, changed_rect):
-            last_failure = "元位置では接していない背景線または図形と重なります。"
-            continue
-        colliding_texts = [
-            text
-            for rect, text in other_spans
-            if any(rect.intersects(line_rect) for line_rect in line_rectangles)
+    max_reduction_ratio = (
+        MAX_SCHEDULE_FONT_REDUCTION_RATIO
+        if len(spec.new_lines) > 1
+        else MAX_OTHER_FONT_REDUCTION_RATIO
+    )
+    maximum_step = round(max_reduction_ratio * 100)
+    font_ascender = float(getattr(font, "ascender", style.ascender or 1.0))
+    font_descender = float(getattr(font, "descender", style.descender or -0.25))
+    spacing_ratios = [0.0]
+    if len(spec.new_lines) > 1:
+        spacing_step_count = round(
+            (MULTILINE_MAX_SPACING_RATIO - MULTILINE_MIN_SPACING_RATIO)
+            / MULTILINE_SPACING_STEP
+        )
+        spacing_ratios = [
+            MULTILINE_MIN_SPACING_RATIO + index * MULTILINE_SPACING_STEP
+            for index in range(spacing_step_count + 1)
         ]
-        if colliding_texts:
-            last_failure = f"交差文字列：{' / '.join(colliding_texts)}"
-            continue
-        return font_size, changed_rect | style.bbox, line_advance
+
+    for step in range(maximum_step + 1):
+        font_size = style.size * (1.0 - step / 100.0)
+        top = style.origin[1] - font_size * font_ascender
+        bottom = style.origin[1] - font_size * font_descender
+        for spacing_ratio in spacing_ratios:
+            line_advance = font_size * spacing_ratio if len(spec.new_lines) > 1 else 0.0
+            line_rectangles = []
+            for line_number, line_text in enumerate(spec.new_lines):
+                width = font.text_length(line_text, fontsize=font_size)
+                y_offset = line_number * line_advance
+                line_rectangles.append(
+                    pymupdf.Rect(
+                        style.origin[0],
+                        min(top, bottom) + y_offset,
+                        style.origin[0] + width,
+                        max(top, bottom) + y_offset,
+                    )
+                )
+            if any(
+                first.intersects(second)
+                for index, first in enumerate(line_rectangles)
+                for second in line_rectangles[index + 1 :]
+            ):
+                last_failure = "変更後の行同士が重なります。"
+                continue
+            changed_rect = pymupdf.Rect(line_rectangles[0])
+            for line_rect in line_rectangles[1:]:
+                changed_rect |= line_rect
+            if not page.rect.contains(changed_rect):
+                last_failure = "ページ領域からはみ出します。"
+                continue
+            if _crosses_new_graphics(page, style.bbox, changed_rect):
+                last_failure = "一般コース欄または元の背景領域からはみ出します。"
+                continue
+            colliding_texts = [
+                text
+                for rect, text in other_spans
+                if any(rect.intersects(line_rect) for line_rect in line_rectangles)
+            ]
+            if colliding_texts:
+                last_failure = f"交差文字列：{' / '.join(colliding_texts)}"
+                continue
+            return font_size, changed_rect | style.bbox, line_advance
 
     raise ReplacementError(
         "変更後文字列を元の位置へ安全に配置できません。",
@@ -672,6 +708,9 @@ def prepare_replacements(pymupdf: Any, doc: Any) -> tuple[PreparedReplacement, .
         print(f"使用フォント：{font_path}")
         print(f"変更後文字列：{spec.new_text}")
         print(f"挿入文字サイズ：{font_size}\n")
+        if len(spec.new_lines) > 1:
+            print(f"2行のベースライン間隔：{line_advance}")
+            print(f"行間倍率：{line_advance / font_size}\n")
         prepared.append(
             PreparedReplacement(
                 spec,
@@ -718,9 +757,11 @@ def prepare_following_line_moves(
     first_group = _find_closest_group_below(
         page, GENERAL_MOVABLE_TEXTS[0], schedule.style.bbox
     )
-    required_top = schedule.changed_rect.y1 + (
-        schedule.font_size * MULTILINE_MIN_GAP_RATIO
+    minimum_gap = max(
+        MINIMUM_FOLLOWING_GAP,
+        schedule.font_size * MULTILINE_MIN_GAP_RATIO,
     )
+    required_top = schedule.changed_rect.y1 + minimum_gap
     y_offset = max(0.0, required_top - first_group.union_rect.y0)
     if y_offset <= 0:
         return ()
@@ -780,6 +821,7 @@ def prepare_following_line_moves(
             )
         )
     print(f"一般コース後続行のY方向移動量：{y_offset}")
+    print(f"一般コース受講日時と後続行の最低余白：{minimum_gap}")
     return tuple(moves)
 
 
