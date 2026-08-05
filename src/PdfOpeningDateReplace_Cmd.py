@@ -14,6 +14,7 @@ import importlib.util
 import inspect
 import os
 import sys
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -326,8 +327,9 @@ def find_target_text(page: Any, spec: ReplacementSpec) -> SearchGroup:
 
 
 def normalize_whitespace_for_comparison(text: str) -> str:
-    """比較時だけUnicode空白を除去し、全角・半角や記号は維持する。"""
-    return "".join(character for character in text if not character.isspace())
+    """比較時だけ空白除去とNFKC正規化を行い、PDFへ書く文字は変えない。"""
+    normalized = unicodedata.normalize("NFKC", text)
+    return "".join(character for character in normalized if not character.isspace())
 
 
 def _matching_text_layers(
