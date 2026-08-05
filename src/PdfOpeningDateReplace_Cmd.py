@@ -41,7 +41,7 @@ NEW_GENERAL_SCHEDULE_LINES = (
 GENERAL_MOVABLE_TEXTS = (
     "全２回：１回２時間",
     "受講料",
-    "５５００円×２回分＝１１０００円　(税込１０％)",
+    "５５００円×２回分＝１１０００円（税込１０％）",
 )
 
 RECEPTION_START_PAGE_INDEX = 3
@@ -329,6 +329,9 @@ def find_target_text(page: Any, spec: ReplacementSpec) -> SearchGroup:
 def normalize_whitespace_for_comparison(text: str) -> str:
     """比較時だけ空白除去とNFKC正規化を行い、PDFへ書く文字は変えない。"""
     normalized = unicodedata.normalize("NFKC", text)
+    normalized = normalized.replace("・", "･")
+    normalized = normalized.replace("〜", "～")
+    normalized = normalized.replace("~", "～")
     return "".join(character for character in normalized if not character.isspace())
 
 
@@ -916,14 +919,23 @@ def apply_replacements(
     prepared: Sequence[PreparedReplacement],
     moves: Sequence[PreparedMove],
 ) -> None:
-    """検査済みの4件を置換し、必要な場合だけ後続行を移動する。"""
+    """先に全旧文字を削除し、新文字が後続redactionで消えないよう挿入する。"""
+    deletion_by_page: dict[int, list[Any]] = {}
+    for item in prepared:
+        deletion_by_page.setdefault(item.spec.page_index, []).extend(
+            item.deletion_rectangles
+        )
+    for move in moves:
+        deletion_by_page.setdefault(move.page_index, []).extend(move.deletion_rectangles)
+
+    for page_index, rectangles in deletion_by_page.items():
+        remove_original_text(pymupdf, doc[page_index], rectangles)
+
     for font_number, item in enumerate(prepared, start=1):
         page = doc[item.spec.page_index]
-        remove_original_text(pymupdf, page, item.deletion_rectangles)
         insert_replacement_text(pymupdf, page, item, font_number)
     for font_number, move in enumerate(moves, start=1):
         page = doc[move.page_index]
-        remove_original_text(pymupdf, page, move.deletion_rectangles)
         insert_moved_text(pymupdf, page, move, font_number)
 
 
@@ -1029,6 +1041,154 @@ def _has_standalone_text_layer(page: Any, text: str) -> bool:
     return False
 
 
+def _expanded_rect(rect: Any, margin_x: float, margin_y: float) -> Any:
+    """検索失敗時の周辺span確認用に矩形を少し広げる。"""
+    return rect.__class__(
+        rect.x0 - margin_x,
+        rect.y0 - margin_y,
+        rect.x1 + margin_x,
+        rect.y1 + margin_y,
+    )
+
+
+def _line_rectangles_for_validation(pymupdf: Any, prepared: PreparedReplacement) -> tuple[Any, ...]:
+    """保存後検証用に、挿入時と同じ基準で各行の想定bboxを再計算する。"""
+    try:
+        font = pymupdf.Font(fontfile=str(prepared.font_path))
+    except Exception:
+        font = None
+    font_ascender = float(getattr(font, "ascender", prepared.style.ascender or 1.0))
+    font_descender = float(getattr(font, "descender", prepared.style.descender or -0.25))
+    top = prepared.style.origin[1] - prepared.font_size * font_ascender
+    bottom = prepared.style.origin[1] - prepared.font_size * font_descender
+    rectangles = []
+    for line_number, line_text in enumerate(prepared.spec.new_lines):
+        if font is not None:
+            width = font.text_length(line_text, fontsize=prepared.font_size)
+        else:
+            width = max(prepared.style.bbox.width, prepared.changed_rect.width)
+        y_offset = line_number * prepared.line_advance
+        rectangles.append(
+            pymupdf.Rect(
+                prepared.style.origin[0],
+                min(top, bottom) + y_offset,
+                prepared.style.origin[0] + width,
+                max(top, bottom) + y_offset,
+            )
+        )
+    return tuple(rectangles)
+
+
+def _line_candidates_near_rect(page: Any, expected_rect: Any) -> tuple[tuple[str, Any, str], ...]:
+    """想定bbox付近のspan/wordを行ごとに連結して返す。"""
+    margin_y = max(4.0, expected_rect.height * 0.75)
+    probe_rect = _expanded_rect(expected_rect, 8.0, margin_y)
+    candidates: list[tuple[str, Any, str]] = []
+
+    for block in page.get_text("dict").get("blocks", []):
+        for line in block.get("lines", []):
+            line_spans = []
+            for span in line.get("spans", []):
+                span_text = str(span.get("text", ""))
+                if not span_text:
+                    continue
+                span_rect = expected_rect.__class__(span["bbox"])
+                if span_rect.intersects(probe_rect):
+                    line_spans.append((span_rect, span_text))
+            if not line_spans:
+                continue
+            line_spans.sort(key=lambda item: item[0].x0)
+            line_rect = expected_rect.__class__(line_spans[0][0])
+            for span_rect, _ in line_spans[1:]:
+                line_rect |= span_rect
+            candidates.append(
+                ("".join(span_text for _, span_text in line_spans), line_rect, "dict")
+            )
+
+    words_by_line: list[list[tuple[Any, str]]] = []
+    for word in page.get_text("words"):
+        if len(word) < 5:
+            continue
+        word_rect = expected_rect.__class__(word[:4])
+        if not word_rect.intersects(probe_rect):
+            continue
+        center_y = (word_rect.y0 + word_rect.y1) / 2.0
+        for line_words in words_by_line:
+            existing = line_words[0][0]
+            existing_center_y = (existing.y0 + existing.y1) / 2.0
+            if abs(center_y - existing_center_y) <= max(3.0, expected_rect.height * 0.35):
+                line_words.append((word_rect, str(word[4])))
+                break
+        else:
+            words_by_line.append([(word_rect, str(word[4]))])
+    for line_words in words_by_line:
+        line_words.sort(key=lambda item: item[0].x0)
+        line_rect = expected_rect.__class__(line_words[0][0])
+        for word_rect, _ in line_words[1:]:
+            line_rect |= word_rect
+        candidates.append(
+            ("".join(word_text for _, word_text in line_words), line_rect, "words")
+        )
+    return tuple(candidates)
+
+
+def _format_validation_candidates(candidates: Sequence[tuple[str, Any, str]]) -> str:
+    """保存後検証エラー時に、対象付近で抽出できた文字列を表示する。"""
+    if not candidates:
+        return "対象bbox付近に抽出可能なspan/wordがありません。"
+    lines = []
+    for index, (text, rect, source) in enumerate(candidates, start=1):
+        lines.append(f"{index}. {source} text={text!r} bbox={tuple(rect)}")
+    return "／".join(lines)
+
+
+def _validate_inserted_line(
+    page: Any,
+    spec: ReplacementSpec,
+    line_number: int,
+    new_line: str,
+    expected_rect: Any,
+) -> None:
+    """search_for失敗時も、抽出文字列と想定bboxで新しい1行を検証する。"""
+    new_rectangles = tuple(page.search_for(new_line))
+    new_groups = group_overlapping_rectangles(new_rectangles)
+    matching_groups = [
+        group
+        for group in new_groups
+        if overlap_ratio(group.union_rect, expected_rect) >= 0.5
+    ]
+    if len(matching_groups) == 1 and len(new_groups) == 1:
+        return
+
+    expected_normalized = normalize_whitespace_for_comparison(new_line)
+    candidates = _line_candidates_near_rect(page, expected_rect)
+    matching_candidates = [
+        (text, rect, source)
+        for text, rect, source in candidates
+        if normalize_whitespace_for_comparison(text) == expected_normalized
+        and overlap_ratio(rect, expected_rect) >= 0.5
+    ]
+    if len(matching_candidates) == 1:
+        print(
+            f"保存後検証：{spec.label}の{line_number}行目は"
+            "search_for()では確認できませんでしたが、"
+            "span/wordと座標で確認しました。"
+        )
+        print(f"保存後検証対象文字列：{new_line}")
+        print(f"保存後検証想定bbox：{tuple(expected_rect)}")
+        return
+
+    raise ReplacementError(
+        "保存後の検証に失敗しました。",
+        f"{spec.label}の{line_number}行目が見た目上1箇所ではありません。"
+        f"（生の検出件数：{len(new_rectangles)}件／"
+        f"表示グループ数：{len(new_groups)}件／"
+        f"span/word一致件数：{len(matching_candidates)}件）"
+        f"／想定bbox：{tuple(expected_rect)}"
+        f"／周辺抽出：{_format_validation_candidates(candidates)}",
+    )
+
+
 def validate_output_pdf(
     pymupdf: Any,
     output_path: Path,
@@ -1053,18 +1213,18 @@ def validate_output_pdf(
         if output_sizes != snapshot.page_sizes:
             raise ReplacementError("保存後の検証に失敗しました。", "ページサイズが変わっています。")
 
-        for spec in REPLACEMENTS:
+        for item in prepared:
+            spec = item.spec
             page = output_doc[spec.page_index]
+            expected_line_rectangles = _line_rectangles_for_validation(pymupdf, item)
             for line_number, new_line in enumerate(spec.new_lines, start=1):
-                new_rectangles = tuple(page.search_for(new_line))
-                new_groups = group_overlapping_rectangles(new_rectangles)
-                if len(new_groups) != 1:
-                    raise ReplacementError(
-                        "保存後の検証に失敗しました。",
-                        f"{spec.label}の{line_number}行目が見た目上1箇所ではありません。"
-                        f"（生の検出件数：{len(new_rectangles)}件／"
-                        f"表示グループ数：{len(new_groups)}件）",
-                    )
+                _validate_inserted_line(
+                    page,
+                    spec,
+                    line_number,
+                    new_line,
+                    expected_line_rectangles[line_number - 1],
+                )
             old_is_contained = any(spec.old_text in line for line in spec.new_lines)
             old_remains = (
                 _has_standalone_text_layer(page, spec.old_text)
