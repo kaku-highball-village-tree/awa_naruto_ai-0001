@@ -932,7 +932,7 @@ def _address_new_rect_collisions(
             is_address_line = normalized_old_address in normalize_whitespace_for_comparison(
                 line_text
             )
-            for character in line_characters:
+            for character_index, character in enumerate(line_characters):
                 character_text = str(character.get("c", ""))
                 if not character_text:
                     continue
@@ -941,6 +941,25 @@ def _address_new_rect_collisions(
                     continue
                 detail = _intersection_detail(new_address_rect, character_rect)
                 if detail[3] > 0:
+                    has_non_whitespace_after = any(
+                        not str(later_character.get("c", "")).isspace()
+                        for later_character in line_characters[character_index + 1 :]
+                        if str(later_character.get("c", ""))
+                    )
+                    is_usable_trailing_whitespace = (
+                        character_text.isspace()
+                        and is_address_line
+                        and character_rect.x0 >= old_address_rect.x1
+                        and not has_non_whitespace_after
+                        and character_rect.y0 < new_address_rect.y1
+                        and character_rect.y1 > new_address_rect.y0
+                    )
+                    if is_usable_trailing_whitespace:
+                        print("住所配置確認：旧住所直後の末尾空白領域を使用します。")
+                        print(f"空白bbox：{tuple(character_rect)}")
+                        print(f"新住所bbox：{tuple(new_address_rect)}")
+                        print("空白の後ろに非空白文字：なし")
+                        continue
                     new_center_y = (new_address_rect.y0 + new_address_rect.y1) / 2.0
                     character_center_y = (character_rect.y0 + character_rect.y1) / 2.0
                     if (
