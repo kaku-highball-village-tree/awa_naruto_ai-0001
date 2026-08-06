@@ -12,6 +12,7 @@ import hashlib
 import importlib
 import importlib.util
 import inspect
+import math
 import os
 import sys
 import unicodedata
@@ -177,6 +178,9 @@ class DocumentSnapshot:
     page_texts: tuple[str, ...]
     untouched_render_hashes: tuple[tuple[int, str], ...]
     edited_renderings: tuple[tuple[int, int, int, int, int, bytes], ...]
+    protected_text_renderings: tuple[
+        tuple[str, tuple[float, float, float, float], int, int, int, int, bytes], ...
+    ]
 
 
 REPLACEMENTS = (
@@ -568,6 +572,78 @@ def _address_character_rectangles(layers: Sequence[TextLayer]) -> tuple[Any, ...
     return tuple(rectangles)
 
 
+def _clip_address_rectangles_above_non_target_characters(
+    page: Any,
+    layers: Sequence[TextLayer],
+    deletion_rectangles: Sequence[Any],
+) -> tuple[Any, ...]:
+    """住所直下の対象外文字bbox上端まで、住所削除矩形の下辺だけを切り詰める。"""
+    target_characters = tuple(
+        (normalize_whitespace_for_comparison(character), rectangle)
+        for layer in layers
+        for character, rectangle in zip(layer.characters, layer.character_rectangles)
+    )
+    non_target_characters: list[tuple[str, Any]] = []
+    for block in page.get_text("rawdict").get("blocks", []):
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                for character in span.get("chars", []):
+                    character_text = str(character.get("c", ""))
+                    if not character_text:
+                        continue
+                    character_rect = page.rect.__class__(character["bbox"])
+                    normalized_character = normalize_whitespace_for_comparison(
+                        character_text
+                    )
+                    if any(
+                        normalized_character == target_character
+                        and overlap_ratio(character_rect, target_rect) >= 0.99
+                        for target_character, target_rect in target_characters
+                    ):
+                        continue
+                    non_target_characters.append((character_text, character_rect))
+
+    clipped_rectangles: list[Any] = []
+    for number, deletion_rect in enumerate(deletion_rectangles, start=1):
+        target_center_y = (deletion_rect.y0 + deletion_rect.y1) / 2.0
+        lower_blockers = [
+            (character_text, character_rect)
+            for character_text, character_rect in non_target_characters
+            if character_rect.x0 < deletion_rect.x1
+            and character_rect.x1 > deletion_rect.x0
+            and character_rect.y0 < deletion_rect.y1
+            and character_rect.y1 > deletion_rect.y0
+            and (character_rect.y0 + character_rect.y1) / 2.0 > target_center_y
+        ]
+        if not lower_blockers:
+            clipped_rectangles.append(deletion_rect)
+            continue
+
+        safe_bottom = min(rect.y0 for _, rect in lower_blockers)
+        safe_bottom = math.nextafter(float(safe_bottom), -math.inf)
+        if safe_bottom <= deletion_rect.y0:
+            blockers = "／".join(
+                f"{text!r} bbox={tuple(rect)}" for text, rect in lower_blockers
+            )
+            raise ReplacementError(
+                "住所文字だけを削除できる高さを確保できませんでした。",
+                f"住所削除矩形：{tuple(deletion_rect)}／対象外文字：{blockers}",
+            )
+        clipped_rect = page.rect.__class__(
+            deletion_rect.x0,
+            deletion_rect.y0,
+            deletion_rect.x1,
+            safe_bottom,
+        )
+        if clipped_rect.get_area() <= 0 or (clipped_rect & deletion_rect).get_area() <= 0:
+            raise ReplacementError("住所の削除矩形を安全に切り詰められませんでした。")
+        print(f"住所削除矩形 {number} 切り詰め前：{tuple(deletion_rect)}")
+        print(f"住所削除矩形 {number} 安全な下端：{safe_bottom}")
+        print(f"住所削除矩形 {number} 切り詰め後：{tuple(clipped_rect)}")
+        clipped_rectangles.append(clipped_rect)
+    return tuple(clipped_rectangles)
+
+
 def _ensure_address_character_rectangles_are_safe(
     page: Any,
     layers: Sequence[TextLayer],
@@ -649,6 +725,9 @@ def _ensure_deletion_rectangles_are_safe(
     """安全確認済みの最小削除矩形を返す。住所だけ文字単位で処理する。"""
     if spec.label == "住所":
         deletion_rectangles = _address_character_rectangles(layers)
+        deletion_rectangles = _clip_address_rectangles_above_non_target_characters(
+            page, layers, deletion_rectangles
+        )
         _ensure_address_character_rectangles_are_safe(
             page, layers, deletion_rectangles
         )
@@ -829,6 +908,19 @@ def _address_new_rect_collisions(
                     continue
                 detail = _intersection_detail(new_address_rect, character_rect)
                 if detail[3] > 0:
+                    new_center_y = (new_address_rect.y0 + new_address_rect.y1) / 2.0
+                    character_center_y = (character_rect.y0 + character_rect.y1) / 2.0
+                    if (
+                        character_center_y > new_center_y
+                        and character_rect.y0 > new_address_rect.y0
+                        and detail[0].y1 == new_address_rect.y1
+                    ):
+                        print(
+                            "新住所bbox下辺と直下文字bboxの形式上の交差："
+                            f"文字={character_text!r}／交差bbox={tuple(detail[0])}／"
+                            f"交差面積={detail[3]}。保存後の保護領域画素で検証します。"
+                        )
+                        continue
                     collisions.append(
                         f"{character_text!r} bbox={tuple(character_rect)} "
                         f"intersection={tuple(detail[0])} area={detail[3]}"
@@ -1244,7 +1336,40 @@ def snapshot_document(doc: Any) -> DocumentSnapshot:
                 bytes(pixmap.samples),
             )
         )
-    return DocumentSnapshot(doc.page_count, sizes, texts, hashes, tuple(renderings))
+    protected_renderings = []
+    address_page = doc[ADDRESS_PAGE_INDEX]
+    for required_text in (REQUIRED_POSTAL_CODE_TEXT, REQUIRED_PHONE_TEXT):
+        groups = group_overlapping_rectangles(
+            tuple(address_page.search_for(required_text))
+        )
+        if len(groups) != 1:
+            raise ReplacementError(
+                "住所周辺の維持対象文字列を一意に確認できませんでした。",
+                f"維持対象：{required_text}／表示グループ数：{len(groups)}件",
+            )
+        protected_rect = groups[0].union_rect
+        protected_pixmap = address_page.get_pixmap(
+            clip=protected_rect, alpha=False
+        )
+        protected_renderings.append(
+            (
+                required_text,
+                tuple(float(value) for value in protected_rect),
+                protected_pixmap.width,
+                protected_pixmap.height,
+                protected_pixmap.n,
+                protected_pixmap.stride,
+                bytes(protected_pixmap.samples),
+            )
+        )
+    return DocumentSnapshot(
+        doc.page_count,
+        sizes,
+        texts,
+        hashes,
+        tuple(renderings),
+        tuple(protected_renderings),
+    )
 
 
 def _validate_edited_page_outside_rectangles(
@@ -1563,6 +1688,31 @@ def validate_output_pdf(
                 raise ReplacementError(
                     "保存後の検証に失敗しました。",
                     f"維持する{label}「{required_text}」が見つかりません。",
+                )
+        for (
+            required_text,
+            rect_values,
+            width,
+            height,
+            components,
+            stride,
+            original_samples,
+        ) in snapshot.protected_text_renderings:
+            protected_rect = output_doc[ADDRESS_PAGE_INDEX].rect.__class__(rect_values)
+            protected_pixmap = address_page.get_pixmap(
+                clip=protected_rect, alpha=False
+            )
+            if (
+                protected_pixmap.width,
+                protected_pixmap.height,
+                protected_pixmap.n,
+                protected_pixmap.stride,
+            ) != (width, height, components, stride) or bytes(
+                protected_pixmap.samples
+            ) != original_samples:
+                raise ReplacementError(
+                    "保存後の検証に失敗しました。",
+                    f"維持対象「{required_text}」の見た目が変わっています。",
                 )
 
         if not output_doc[OPENING_DATE_PAGE_INDEX].search_for(REQUIRED_WEEKLY_TEXT):
