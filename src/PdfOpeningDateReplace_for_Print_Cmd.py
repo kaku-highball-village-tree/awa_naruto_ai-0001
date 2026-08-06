@@ -572,12 +572,12 @@ def _address_character_rectangles(layers: Sequence[TextLayer]) -> tuple[Any, ...
     return tuple(rectangles)
 
 
-def _clip_address_rectangles_above_non_target_characters(
+def _clip_address_rectangles_away_from_non_target_characters(
     page: Any,
     layers: Sequence[TextLayer],
     deletion_rectangles: Sequence[Any],
 ) -> tuple[Any, ...]:
-    """住所直下の対象外文字bbox上端まで、住所削除矩形の下辺だけを切り詰める。"""
+    """隣接する対象外文字bboxとの境界まで、住所削除矩形の各辺を切り詰める。"""
     target_characters = tuple(
         (normalize_whitespace_for_comparison(character), rectangle)
         for layer in layers
@@ -605,40 +605,73 @@ def _clip_address_rectangles_above_non_target_characters(
 
     clipped_rectangles: list[Any] = []
     for number, deletion_rect in enumerate(deletion_rectangles, start=1):
+        target_center_x = (deletion_rect.x0 + deletion_rect.x1) / 2.0
         target_center_y = (deletion_rect.y0 + deletion_rect.y1) / 2.0
-        lower_blockers = [
+        blockers = [
             (character_text, character_rect)
             for character_text, character_rect in non_target_characters
             if character_rect.x0 < deletion_rect.x1
             and character_rect.x1 > deletion_rect.x0
             and character_rect.y0 < deletion_rect.y1
             and character_rect.y1 > deletion_rect.y0
-            and (character_rect.y0 + character_rect.y1) / 2.0 > target_center_y
         ]
-        if not lower_blockers:
+        if not blockers:
             clipped_rectangles.append(deletion_rect)
             continue
 
-        safe_bottom = min(rect.y0 for _, rect in lower_blockers)
-        safe_bottom = math.nextafter(float(safe_bottom), -math.inf)
-        if safe_bottom <= deletion_rect.y0:
-            blockers = "／".join(
-                f"{text!r} bbox={tuple(rect)}" for text, rect in lower_blockers
+        safe_left = float(deletion_rect.x0)
+        safe_top = float(deletion_rect.y0)
+        safe_right = float(deletion_rect.x1)
+        safe_bottom = float(deletion_rect.y1)
+        for character_text, character_rect in blockers:
+            character_center_x = (character_rect.x0 + character_rect.x1) / 2.0
+            character_center_y = (character_rect.y0 + character_rect.y1) / 2.0
+            delta_x = character_center_x - target_center_x
+            delta_y = character_center_y - target_center_y
+            # 中心間の差が大きい軸を使い、住所から見た隣接方向を決める。
+            if abs(delta_x) >= abs(delta_y):
+                if delta_x < 0:
+                    safe_left = max(
+                        safe_left,
+                        math.nextafter(float(character_rect.x1), math.inf),
+                    )
+                else:
+                    safe_right = min(
+                        safe_right,
+                        math.nextafter(float(character_rect.x0), -math.inf),
+                    )
+            elif delta_y < 0:
+                safe_top = max(
+                    safe_top,
+                    math.nextafter(float(character_rect.y1), math.inf),
+                )
+            else:
+                safe_bottom = min(
+                    safe_bottom,
+                    math.nextafter(float(character_rect.y0), -math.inf),
+                )
+
+        if safe_left >= safe_right or safe_top >= safe_bottom:
+            blocker_detail = "／".join(
+                f"{text!r} bbox={tuple(rect)}" for text, rect in blockers
             )
             raise ReplacementError(
-                "住所文字だけを削除できる高さを確保できませんでした。",
-                f"住所削除矩形：{tuple(deletion_rect)}／対象外文字：{blockers}",
+                "住所文字だけを削除できる領域を確保できませんでした。",
+                f"住所削除矩形：{tuple(deletion_rect)}／対象外文字：{blocker_detail}",
             )
         clipped_rect = page.rect.__class__(
-            deletion_rect.x0,
-            deletion_rect.y0,
-            deletion_rect.x1,
+            safe_left,
+            safe_top,
+            safe_right,
             safe_bottom,
         )
         if clipped_rect.get_area() <= 0 or (clipped_rect & deletion_rect).get_area() <= 0:
             raise ReplacementError("住所の削除矩形を安全に切り詰められませんでした。")
         print(f"住所削除矩形 {number} 切り詰め前：{tuple(deletion_rect)}")
-        print(f"住所削除矩形 {number} 安全な下端：{safe_bottom}")
+        print(
+            f"住所削除矩形 {number} 安全な境界："
+            f"left={safe_left}, top={safe_top}, right={safe_right}, bottom={safe_bottom}"
+        )
         print(f"住所削除矩形 {number} 切り詰め後：{tuple(clipped_rect)}")
         clipped_rectangles.append(clipped_rect)
     return tuple(clipped_rectangles)
@@ -725,7 +758,7 @@ def _ensure_deletion_rectangles_are_safe(
     """安全確認済みの最小削除矩形を返す。住所だけ文字単位で処理する。"""
     if spec.label == "住所":
         deletion_rectangles = _address_character_rectangles(layers)
-        deletion_rectangles = _clip_address_rectangles_above_non_target_characters(
+        deletion_rectangles = _clip_address_rectangles_away_from_non_target_characters(
             page, layers, deletion_rectangles
         )
         _ensure_address_character_rectangles_are_safe(
