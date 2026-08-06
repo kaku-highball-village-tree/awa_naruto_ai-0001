@@ -26,6 +26,10 @@ INPUT_PDF_NAME = "チラシ用_阿波なるとAI塾_編集前の原稿.pdf"
 OUTPUT_PDF_NAME = "チラシ用_阿波なるとAI塾_変更後.pdf"
 ERROR_FILE_NAME = "チラシ用_阿波なるとAI塾_変更後_error.txt"
 
+ADDRESS_PAGE_INDEX = 0
+OLD_ADDRESS_TEXT = "鳴⾨市⽊津町⽊津野7-11"
+NEW_ADDRESS_TEXT = "鳴門市大津町木津野内田7-11"
+
 OPENING_DATE_PAGE_INDEX = 1
 OLD_CHILD_OPENING_DATE_TEXT = "令和８年８月６日開講"
 NEW_CHILD_OPENING_DATE_TEXT = "令和８年９月３日開講／令和８年10月８日開講"
@@ -166,6 +170,12 @@ class DocumentSnapshot:
 
 REPLACEMENTS = (
     ReplacementSpec(
+        "住所",
+        ADDRESS_PAGE_INDEX,
+        OLD_ADDRESS_TEXT,
+        (NEW_ADDRESS_TEXT,),
+    ),
+    ReplacementSpec(
         "児童コース開講日",
         OPENING_DATE_PAGE_INDEX,
         OLD_CHILD_OPENING_DATE_TEXT,
@@ -204,7 +214,7 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--render-comparison",
         action="store_true",
-        help="2ページ目の変更前後を確認用PNGとして出力します。",
+        help="1・2ページ目の変更前後を確認用PNGとして出力します。",
     )
     return parser.parse_args(argv)
 
@@ -299,10 +309,11 @@ def inspect_print_pdf_structure(doc: Any) -> None:
                 f"{page_index + 1}ページ目" for page_index in found_page_indexes
             ) or "なし"
             raise ReplacementError(
-                "変更対象が印刷用PDFの2ページ目だけに存在することを確認できません。",
-                f"処理対象：{spec.label}／検出ページ：{displayed_pages}",
+                "変更対象が指定ページだけに存在することを確認できません。",
+                f"処理対象：{spec.label}／必要ページ：{spec.page_index + 1}ページ目"
+                f"／検出ページ：{displayed_pages}",
             )
-    print("5つの変更対象がすべて2ページ目だけにあることを確認しました。\n")
+    print("住所が1ページ目、その他5つの変更対象が2ページ目にあることを確認しました。\n")
 
 
 def overlap_ratio(rectangle1: Any, rectangle2: Any) -> float:
@@ -748,7 +759,7 @@ def ensure_text_only_redaction_supported(pymupdf: Any, page: Any) -> None:
 
 
 def prepare_replacements(pymupdf: Any, doc: Any) -> tuple[PreparedReplacement, ...]:
-    """5件すべてを編集前に検査し、部分的な変更を防ぐ。"""
+    """6件すべてを編集前に検査し、部分的な変更を防ぐ。"""
     prepared: list[PreparedReplacement] = []
     for spec in REPLACEMENTS:
         page = doc[spec.page_index]
@@ -1385,7 +1396,7 @@ def _available_comparison_path(program_dir: Path, phase: str, page_number: int) 
 def render_comparison_images(
     doc: Any, program_dir: Path, phase: str
 ) -> tuple[Path, ...]:
-    """2ページ目をPDFとは独立した確認用PNGへ描画する。"""
+    """変更対象の1・2ページ目をPDFとは独立した確認用PNGへ描画する。"""
     paths: list[Path] = []
     for page_index in sorted({spec.page_index for spec in REPLACEMENTS}):
         path = _available_comparison_path(program_dir, phase, page_index + 1)
@@ -1402,7 +1413,7 @@ def write_error_file(program_dir: Path, error: ReplacementError) -> Path | None:
         lines = [
             "処理結果：エラー",
             f"入力PDF：{INPUT_PDF_NAME}",
-            "対象ページ：2ページ目",
+            "対象ページ：1ページ目、2ページ目",
         ]
         for replacement in REPLACEMENTS:
             lines.extend(
@@ -1426,7 +1437,7 @@ def write_error_file(program_dir: Path, error: ReplacementError) -> Path | None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """印刷用チラシの5箇所の文字列差し替えを安全に実行する。"""
+    """印刷用チラシの6箇所の文字列差し替えを安全に実行する。"""
     args = parse_arguments(argv)
     program_dir = Path(__file__).resolve().parent
     doc: Any | None = None
