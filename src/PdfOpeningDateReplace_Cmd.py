@@ -48,6 +48,10 @@ RECEPTION_START_PAGE_INDEX = 3
 OLD_RECEPTION_START_TEXT = "令和８年７月１日より受付開始"
 NEW_RECEPTION_START_TEXT = "令和８年８月１日より受付開始"
 
+COMPUTER_NOTE_PAGE_INDEX = 3
+OLD_COMPUTER_NOTE_TEXT = "※どちらか一方でも可"
+NEW_COMPUTER_NOTE_TEXT = "※どちらか一方でも可(パソコン推奨)"
+
 REQUIRED_WEEKLY_TEXT = "毎週木曜日"
 REQUIRED_RECEPTION_TEXTS = ("募集期間", "(各コース開講前まで応募可能)")
 EXPECTED_PAGE_COUNT = 5
@@ -184,6 +188,12 @@ REPLACEMENTS = (
         RECEPTION_START_PAGE_INDEX,
         OLD_RECEPTION_START_TEXT,
         (NEW_RECEPTION_START_TEXT,),
+    ),
+    ReplacementSpec(
+        "パソコン推奨注意書き",
+        COMPUTER_NOTE_PAGE_INDEX,
+        OLD_COMPUTER_NOTE_TEXT,
+        (NEW_COMPUTER_NOTE_TEXT,),
     ),
 )
 
@@ -699,7 +709,7 @@ def ensure_text_only_redaction_supported(pymupdf: Any, page: Any) -> None:
 
 
 def prepare_replacements(pymupdf: Any, doc: Any) -> tuple[PreparedReplacement, ...]:
-    """4件すべてを編集前に検査し、部分的な変更を防ぐ。"""
+    """5件すべてを編集前に検査し、部分的な変更を防ぐ。"""
     prepared: list[PreparedReplacement] = []
     for spec in REPLACEMENTS:
         page = doc[spec.page_index]
