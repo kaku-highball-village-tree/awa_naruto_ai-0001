@@ -30,6 +30,8 @@ ADDRESS_PAGE_INDEX = 0
 OLD_ADDRESS_TEXT = "鳴門市木津町木津野7-11"
 OLD_ADDRESS_TEXT_ALIASES = ("鳴⾨市⽊津町⽊津野7-11",)
 NEW_ADDRESS_TEXT = "鳴門市大津町木津野内田7-11"
+REQUIRED_POSTAL_CODE_TEXT = "〒772-0031"
+REQUIRED_PHONE_TEXT = "０９０−４７８０−２９６７"
 
 OPENING_DATE_PAGE_INDEX = 1
 OLD_CHILD_OPENING_DATE_TEXT = "令和８年８月６日開講"
@@ -136,6 +138,8 @@ class TextLayer:
     origin: tuple[float, float]
     ascender: float | None
     descender: float | None
+    characters: tuple[str, ...]
+    character_rectangles: tuple[Any, ...]
 
 
 @dataclass(frozen=True)
@@ -494,6 +498,14 @@ def _matching_text_layers(
                     (float(origin_value[0]), float(origin_value[1])),
                     representative_span.get("ascender"),
                     representative_span.get("descender"),
+                    tuple(
+                        str(character.get("c", ""))
+                        for character, _ in visible_candidates
+                    ),
+                    tuple(
+                        page.rect.__class__(character["bbox"])
+                        for character, _ in visible_candidates
+                    ),
                 )
             )
     return tuple(layers)
@@ -517,13 +529,130 @@ def _choose_representative_layer(layers: Sequence[TextLayer]) -> TextLayer:
     )
 
 
+def _intersection_detail(rectangle1: Any, rectangle2: Any) -> tuple[Any, float, float, float, float, float]:
+    """2矩形の交差矩形、寸法、面積、および双方に対する面積率を返す。"""
+    intersection = rectangle1 & rectangle2
+    if intersection.is_empty:
+        return intersection, 0.0, 0.0, 0.0, 0.0, 0.0
+    area = intersection.get_area()
+    area1 = rectangle1.get_area()
+    area2 = rectangle2.get_area()
+    return (
+        intersection,
+        max(0.0, float(intersection.width)),
+        max(0.0, float(intersection.height)),
+        area,
+        area / area1 if area1 > 0 else 0.0,
+        area / area2 if area2 > 0 else 0.0,
+    )
+
+
+def _address_character_rectangles(layers: Sequence[TextLayer]) -> tuple[Any, ...]:
+    """重複レイヤーを含む住所文字だけのbboxを、同一矩形をまとめて返す。"""
+    rectangles: list[Any] = []
+    for layer_number, layer in enumerate(layers, start=1):
+        for character_number, (character, rectangle) in enumerate(
+            zip(layer.characters, layer.character_rectangles), start=1
+        ):
+            print(
+                f"住所 layer {layer_number} 文字 {character_number}："
+                f"{character!r} U+{ord(character):04X} bbox={tuple(rectangle)}"
+            )
+            if not any(tuple(existing) == tuple(rectangle) for existing in rectangles):
+                rectangles.append(rectangle)
+    if not rectangles:
+        raise ReplacementError("住所を構成する文字bboxを取得できませんでした。")
+    print(f"住所文字単位の最終削除矩形数：{len(rectangles)}件")
+    for number, rectangle in enumerate(rectangles, start=1):
+        print(f"住所最終削除矩形 {number}：{tuple(rectangle)}")
+    return tuple(rectangles)
+
+
+def _ensure_address_character_rectangles_are_safe(
+    page: Any,
+    layers: Sequence[TextLayer],
+    deletion_rectangles: Sequence[Any],
+) -> None:
+    """住所文字bboxが郵便番号・電話番号などの対象外文字へ侵入しないことを確認する。"""
+    target_characters = tuple(
+        (normalize_whitespace_for_comparison(character), rectangle)
+        for layer in layers
+        for character, rectangle in zip(layer.characters, layer.character_rectangles)
+    )
+    address_rect = page.rect.__class__(deletion_rectangles[0])
+    for rectangle in deletion_rectangles[1:]:
+        address_rect |= rectangle
+    print(f"住所文字bboxの和集合：{tuple(address_rect)}")
+
+    for block in page.get_text("rawdict").get("blocks", []):
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                span_text = "".join(
+                    str(character.get("c", "")) for character in span.get("chars", [])
+                )
+                if not span_text:
+                    continue
+                span_rect = page.rect.__class__(span["bbox"])
+                span_intersection = _intersection_detail(address_rect, span_rect)
+                if span_intersection[3] > 0:
+                    print(f"住所周辺span文字列：{span_text!r}")
+                    print(f"住所周辺span bbox：{tuple(span_rect)}")
+                    print(f"span交差bbox：{tuple(span_intersection[0])}")
+                    print(f"span交差幅：{span_intersection[1]}")
+                    print(f"span交差高さ：{span_intersection[2]}")
+                    print(f"span交差面積：{span_intersection[3]}")
+                    print(f"住所bboxに対するspan交差率：{span_intersection[4]}")
+                    print(f"span bboxに対する交差率：{span_intersection[5]}")
+
+                for character in span.get("chars", []):
+                    character_text = str(character.get("c", ""))
+                    if not character_text:
+                        continue
+                    character_rect = page.rect.__class__(character["bbox"])
+                    normalized_character = normalize_whitespace_for_comparison(
+                        character_text
+                    )
+                    is_target_character = any(
+                        normalized_character == target_character
+                        and overlap_ratio(character_rect, target_rect) >= 0.99
+                        for target_character, target_rect in target_characters
+                    )
+                    if is_target_character:
+                        continue
+                    for deletion_rect in deletion_rectangles:
+                        detail = _intersection_detail(deletion_rect, character_rect)
+                        if detail[3] <= 0:
+                            continue
+                        collision_detail = (
+                            f"対象外文字：{character_text!r}／"
+                            f"文字bbox：{tuple(character_rect)}／"
+                            f"削除矩形：{tuple(deletion_rect)}／"
+                            f"交差bbox：{tuple(detail[0])}／交差幅：{detail[1]}／"
+                            f"交差高さ：{detail[2]}／交差面積：{detail[3]}／"
+                            f"削除矩形に対する交差率：{detail[4]}／"
+                            f"対象外文字bboxに対する交差率：{detail[5]}"
+                        )
+                        print("住所文字単位安全確認：" + collision_detail)
+                        raise ReplacementError(
+                            "住所の削除矩形が対象外文字へ侵入するため、処理を中止しました。",
+                            collision_detail,
+                        )
+    print("住所の削除矩形が対象外の各文字bboxへ侵入しないことを確認しました。")
+
+
 def _ensure_deletion_rectangles_are_safe(
     page: Any,
     layers: Sequence[TextLayer],
     search_group: SearchGroup,
     spec: ReplacementSpec,
-) -> None:
-    """交差span群の空白除去後文字列と座標が対象に一致することを確認する。"""
+) -> tuple[Any, ...]:
+    """安全確認済みの最小削除矩形を返す。住所だけ文字単位で処理する。"""
+    if spec.label == "住所":
+        deletion_rectangles = _address_character_rectangles(layers)
+        _ensure_address_character_rectangles_are_safe(
+            page, layers, deletion_rectangles
+        )
+        return deletion_rectangles
     normalized_old_text = normalize_whitespace_for_comparison(spec.old_text)
     for block in page.get_text("dict").get("blocks", []):
         for line in block.get("lines", []):
@@ -554,12 +683,6 @@ def _ensure_deletion_rectangles_are_safe(
             text_matches = (
                 all(text == normalized_old_text for text in normalized_span_texts)
                 or normalized_combined_text == normalized_old_text
-                # 郵便番号と住所が同一spanでも、rawdictから得た住所の
-                # 文字単位矩形だけを削除する場合は安全と判断する。
-                or (
-                    spec.label == "住所"
-                    and normalized_old_text in normalized_combined_text
-                )
             )
             combined_rect = page.rect.__class__(intersecting_spans[0][1])
             for _, span_rect in intersecting_spans[1:]:
@@ -572,6 +695,7 @@ def _ensure_deletion_rectangles_are_safe(
                     "変更対象以外の文字を削除する可能性があるため、処理を中止しました。",
                     f"処理対象：{spec.label}／交差文字列：{combined_text}",
                 )
+    return tuple(layer.rect for layer in layers)
 
 
 def get_original_text_style(
@@ -600,7 +724,9 @@ def get_original_text_style(
             "検索結果と内部文字レイヤーの位置が一致しません。",
             f"処理対象：{spec.label}",
         )
-    _ensure_deletion_rectangles_are_safe(page, layers, search_group, spec)
+    deletion_rectangles = _ensure_deletion_rectangles_are_safe(
+        page, layers, search_group, spec
+    )
     representative = _choose_representative_layer(layers)
     print(f"内部文字レイヤー数：{len(layers)}件")
     for number, layer in enumerate(layers, start=1):
@@ -623,7 +749,7 @@ def get_original_text_style(
         ascender=representative.ascender,
         descender=representative.descender,
     )
-    return style, tuple(layer.rect for layer in layers)
+    return style, deletion_rectangles
 
 
 def _font_candidates(is_bold: bool) -> tuple[str, ...]:
@@ -673,6 +799,41 @@ def _span_rectangles(
                 ):
                     rectangles.append((rect, text))
     return rectangles
+
+
+def _address_new_rect_collisions(
+    page: Any, old_address_rect: Any, new_address_rect: Any
+) -> list[str]:
+    """新住所bboxと、旧住所文字を除く各文字bboxとの実質的な交差を返す。"""
+    collisions: list[str] = []
+    normalized_old_address = normalize_whitespace_for_comparison(OLD_ADDRESS_TEXT)
+    for block in page.get_text("rawdict").get("blocks", []):
+        for line in block.get("lines", []):
+            line_characters = [
+                character
+                for span in line.get("spans", [])
+                for character in span.get("chars", [])
+            ]
+            line_text = "".join(
+                str(character.get("c", "")) for character in line_characters
+            )
+            is_address_line = normalized_old_address in normalize_whitespace_for_comparison(
+                line_text
+            )
+            for character in line_characters:
+                character_text = str(character.get("c", ""))
+                if not character_text:
+                    continue
+                character_rect = page.rect.__class__(character["bbox"])
+                if is_address_line and overlap_ratio(character_rect, old_address_rect) > 0:
+                    continue
+                detail = _intersection_detail(new_address_rect, character_rect)
+                if detail[3] > 0:
+                    collisions.append(
+                        f"{character_text!r} bbox={tuple(character_rect)} "
+                        f"intersection={tuple(detail[0])} area={detail[3]}"
+                    )
+    return collisions
 
 
 def _crosses_new_graphics(page: Any, old_rect: Any, new_rect: Any) -> bool:
@@ -764,11 +925,20 @@ def calculate_placement(
             if _crosses_new_graphics(page, style.bbox, changed_rect):
                 last_failure = "一般コース欄または元の背景領域からはみ出します。"
                 continue
-            colliding_texts = [
-                text
-                for rect, text in other_spans
-                if any(rect.intersects(line_rect) for line_rect in line_rectangles)
-            ]
+            if spec.label == "住所":
+                colliding_texts = [
+                    collision
+                    for line_rect in line_rectangles
+                    for collision in _address_new_rect_collisions(
+                        page, style.bbox, line_rect
+                    )
+                ]
+            else:
+                colliding_texts = [
+                    text
+                    for rect, text in other_spans
+                    if any(rect.intersects(line_rect) for line_rect in line_rectangles)
+                ]
             if colliding_texts:
                 last_failure = f"交差文字列：{' / '.join(colliding_texts)}"
                 continue
@@ -1382,6 +1552,17 @@ def validate_output_pdf(
                 raise ReplacementError(
                     "保存後の検証に失敗しました。",
                     f"移動後の文字列「{move.text}」を確認できません。",
+                )
+
+        address_page = output_doc[ADDRESS_PAGE_INDEX]
+        for required_text, label in (
+            (REQUIRED_POSTAL_CODE_TEXT, "郵便番号"),
+            (REQUIRED_PHONE_TEXT, "電話番号"),
+        ):
+            if not address_page.search_for(required_text):
+                raise ReplacementError(
+                    "保存後の検証に失敗しました。",
+                    f"維持する{label}「{required_text}」が見つかりません。",
                 )
 
         if not output_doc[OPENING_DATE_PAGE_INDEX].search_for(REQUIRED_WEEKLY_TEXT):
