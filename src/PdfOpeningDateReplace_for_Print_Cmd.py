@@ -27,7 +27,8 @@ OUTPUT_PDF_NAME = "チラシ用_阿波なるとAI塾_変更後.pdf"
 ERROR_FILE_NAME = "チラシ用_阿波なるとAI塾_変更後_error.txt"
 
 ADDRESS_PAGE_INDEX = 0
-OLD_ADDRESS_TEXT = "鳴⾨市⽊津町⽊津野7-11"
+OLD_ADDRESS_TEXT = "鳴門市木津町木津野7-11"
+OLD_ADDRESS_TEXT_ALIASES = ("鳴⾨市⽊津町⽊津野7-11",)
 NEW_ADDRESS_TEXT = "鳴門市大津町木津野内田7-11"
 
 OPENING_DATE_PAGE_INDEX = 1
@@ -87,11 +88,17 @@ class ReplacementSpec:
     page_index: int
     old_text: str
     new_lines: tuple[str, ...]
+    old_text_aliases: tuple[str, ...] = ()
 
     @property
     def new_text(self) -> str:
         """ログとエラー情報向けに変更後文字列を改行付きで返す。"""
         return "\n".join(self.new_lines)
+
+    @property
+    def old_text_candidates(self) -> tuple[str, ...]:
+        """PDF内部表記の違いを許容する旧文字列候補を返す。"""
+        return (self.old_text, *self.old_text_aliases)
 
 
 @dataclass(frozen=True)
@@ -174,6 +181,7 @@ REPLACEMENTS = (
         ADDRESS_PAGE_INDEX,
         OLD_ADDRESS_TEXT,
         (NEW_ADDRESS_TEXT,),
+        OLD_ADDRESS_TEXT_ALIASES,
     ),
     ReplacementSpec(
         "児童コース開講日",
@@ -292,9 +300,17 @@ def inspect_print_pdf_structure(doc: Any) -> None:
 
     for spec in REPLACEMENTS:
         print(f"所在確認：{spec.label}／検索文字列：{spec.old_text}")
+        if spec.old_text_aliases:
+            print(f"検索別表記：{'／'.join(spec.old_text_aliases)}")
+            for candidate in spec.old_text_candidates:
+                code_points = " ".join(
+                    f"{character}=U+{ord(character):04X}" for character in candidate
+                )
+                print(f"検索候補repr：{candidate!r}")
+                print(f"検索候補コードポイント：{code_points}")
         found_page_indexes: list[int] = []
         for page_index, page in enumerate(doc):
-            rectangles = tuple(page.search_for(spec.old_text))
+            rectangles = search_for_old_text_candidates(page, spec)
             groups = group_overlapping_rectangles(rectangles)
             print(
                 f"  {page_index + 1}ページ目：生の検出件数={len(rectangles)}件、"
@@ -358,7 +374,7 @@ def group_overlapping_rectangles(rectangles: Sequence[Any]) -> tuple[SearchGroup
 
 def find_target_text(page: Any, spec: ReplacementSpec) -> SearchGroup:
     """旧文字列を検索し、表示位置が厳密に1グループの場合だけ返す。"""
-    rectangles = tuple(page.search_for(spec.old_text))
+    rectangles = search_for_old_text_candidates(page, spec)
     print(f"変更対象：{spec.label}")
     print(f"対象ページ：{spec.page_index + 1}ページ目")
     print(f"検索文字列：{spec.old_text}")
@@ -393,6 +409,22 @@ def normalize_whitespace_for_comparison(text: str) -> str:
     normalized = normalized.replace("〜", "～")
     normalized = normalized.replace("~", "～")
     return "".join(character for character in normalized if not character.isspace())
+
+
+def search_for_old_text_candidates(page: Any, spec: ReplacementSpec) -> tuple[Any, ...]:
+    """通常漢字・PDF由来の部首文字候補を検索し、同一矩形をまとめて返す。"""
+    rectangles: list[Any] = []
+    for candidate in spec.old_text_candidates:
+        candidate_rectangles = tuple(page.search_for(candidate))
+        if candidate_rectangles:
+            print(f"採用可能な検索候補：{candidate!r}（{len(candidate_rectangles)}件）")
+        for candidate_rect in candidate_rectangles:
+            if not any(
+                overlap_ratio(candidate_rect, existing_rect) >= 0.99
+                for existing_rect in rectangles
+            ):
+                rectangles.append(candidate_rect)
+    return tuple(rectangles)
 
 
 def _matching_text_layers(
@@ -516,10 +548,18 @@ def _ensure_deletion_rectangles_are_safe(
             combined_text = "".join(
                 str(span.get("text", "")) for span, _ in intersecting_spans
             )
+            normalized_combined_text = normalize_whitespace_for_comparison(
+                combined_text
+            )
             text_matches = (
                 all(text == normalized_old_text for text in normalized_span_texts)
-                or normalize_whitespace_for_comparison(combined_text)
-                == normalized_old_text
+                or normalized_combined_text == normalized_old_text
+                # 郵便番号と住所が同一spanでも、rawdictから得た住所の
+                # 文字単位矩形だけを削除する場合は安全と判断する。
+                or (
+                    spec.label == "住所"
+                    and normalized_old_text in normalized_combined_text
+                )
             )
             combined_rect = page.rect.__class__(intersecting_spans[0][1])
             for _, span_rect in intersecting_spans[1:]:
@@ -1097,12 +1137,34 @@ def _validate_edited_page_outside_rectangles(
 
 def _has_standalone_text_layer(page: Any, text: str) -> bool:
     """別文字列の一部ではなく、単独spanとして旧文字列が残っているか確認する。"""
+    normalized_text = normalize_whitespace_for_comparison(text)
     for block in page.get_text("rawdict").get("blocks", []):
         for line in block.get("lines", []):
             for span in line.get("spans", []):
                 span_text = "".join(char.get("c", "") for char in span.get("chars", []))
-                if span_text == text:
+                if normalize_whitespace_for_comparison(span_text) == normalized_text:
                     return True
+    return False
+
+
+def _old_text_remains(page: Any, spec: ReplacementSpec) -> bool:
+    """検索候補とrawdictの双方で変更前文字列が残っていないか確認する。"""
+    if search_for_old_text_candidates(page, spec):
+        return True
+    normalized_candidates = {
+        normalize_whitespace_for_comparison(candidate)
+        for candidate in spec.old_text_candidates
+    }
+    for block in page.get_text("rawdict").get("blocks", []):
+        for line in block.get("lines", []):
+            line_text = "".join(
+                str(character.get("c", ""))
+                for span in line.get("spans", [])
+                for character in span.get("chars", [])
+            )
+            normalized_line = normalize_whitespace_for_comparison(line_text)
+            if any(candidate in normalized_line for candidate in normalized_candidates):
+                return True
     return False
 
 
@@ -1294,7 +1356,7 @@ def validate_output_pdf(
             old_remains = (
                 _has_standalone_text_layer(page, spec.old_text)
                 if old_is_contained
-                else bool(page.search_for(spec.old_text))
+                else _old_text_remains(page, spec)
             )
             if old_remains:
                 raise ReplacementError(
@@ -1422,6 +1484,20 @@ def write_error_file(program_dir: Path, error: ReplacementError) -> Path | None:
                     f"{replacement.label}変更後文字列：{replacement.new_text}",
                 )
             )
+            if replacement.old_text_aliases:
+                lines.append(
+                    f"{replacement.label}検索別表記："
+                    + "／".join(replacement.old_text_aliases)
+                )
+                for candidate in replacement.old_text_candidates:
+                    lines.append(f"{replacement.label}検索候補repr：{candidate!r}")
+                    lines.append(
+                        f"{replacement.label}検索候補コードポイント："
+                        + " ".join(
+                            f"{character}=U+{ord(character):04X}"
+                            for character in candidate
+                        )
+                    )
         lines.extend(
             (
                 f"エラー内容：{error.message}",
