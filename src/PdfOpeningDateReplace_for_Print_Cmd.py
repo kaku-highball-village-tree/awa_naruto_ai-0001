@@ -419,6 +419,23 @@ def normalize_whitespace_for_comparison(text: str) -> str:
     return "".join(character for character in normalized if not character.isspace())
 
 
+def normalize_address_for_comparison(text: str) -> str:
+    """住所の検証時だけ、PDF再抽出で変化するハイフン類をASCIIへ統一する。"""
+    normalized = normalize_whitespace_for_comparison(text)
+    hyphen_variants = {
+        "\u002d",  # HYPHEN-MINUS
+        "\u2010",  # HYPHEN
+        "\u2011",  # NON-BREAKING HYPHEN
+        "\u2013",  # EN DASH
+        "\u2212",  # MINUS SIGN
+        "\uff0d",  # FULLWIDTH HYPHEN-MINUS
+    }
+    return "".join(
+        "-" if character in hyphen_variants else character
+        for character in normalized
+    )
+
+
 def search_for_old_text_candidates(page: Any, spec: ReplacementSpec) -> tuple[Any, ...]:
     """通常漢字・PDF由来の部首文字候補を検索し、同一矩形をまとめて返す。"""
     rectangles: list[Any] = []
@@ -1634,12 +1651,17 @@ def _validate_inserted_line(
     if len(matching_groups) == 1 and len(new_groups) == 1:
         return
 
-    expected_normalized = normalize_whitespace_for_comparison(new_line)
+    normalize_for_validation = (
+        normalize_address_for_comparison
+        if spec.label == "住所"
+        else normalize_whitespace_for_comparison
+    )
+    expected_normalized = normalize_for_validation(new_line)
     candidates = _line_candidates_near_rect(page, expected_rect)
     matching_candidates = [
         (text, rect, source)
         for text, rect, source in candidates
-        if normalize_whitespace_for_comparison(text) == expected_normalized
+        if normalize_for_validation(text) == expected_normalized
         and overlap_ratio(rect, expected_rect) >= 0.5
     ]
     if len(matching_candidates) == 1:
