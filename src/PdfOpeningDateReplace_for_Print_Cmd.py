@@ -1511,8 +1511,57 @@ def _has_standalone_text_layer(page: Any, text: str) -> bool:
     return False
 
 
+def _normalize_for_old_text_removal_check(text: str) -> str:
+    """旧表記の残存確認では、全角・半角を維持して改行だけを除く。"""
+    return text.replace("\r", "").replace("\n", "")
+
+
+def _old_general_schedule_text_remains(page: Any, spec: ReplacementSpec) -> bool:
+    """受講日時の新旧表記を区別し、旧全角表記だけの残存を確認する。"""
+    old_search_rectangles = tuple(page.search_for(spec.old_text))
+    print(
+        "保存後検証：一般コース受講日時の変更前文字列search_for()件数："
+        f"{len(old_search_rectangles)}件"
+    )
+    print(f"変更前文字列repr：{spec.old_text!r}")
+    print(f"変更後1行目repr：{spec.new_lines[0]!r}")
+    print(
+        "変更前文字列の現在の正規化結果："
+        f"{normalize_whitespace_for_comparison(spec.old_text)!r}"
+    )
+    print(
+        "変更後1行目の現在の正規化結果："
+        f"{normalize_whitespace_for_comparison(spec.new_lines[0])!r}"
+    )
+    if old_search_rectangles:
+        return True
+
+    old_text = _normalize_for_old_text_removal_check(spec.old_text)
+    rawdict = page.get_text("rawdict")
+    for block in rawdict.get("blocks", []):
+        for line in block.get("lines", []):
+            line_parts: list[str] = []
+            for span in line.get("spans", []):
+                span_text = "".join(
+                    str(character.get("c", ""))
+                    for character in span.get("chars", [])
+                )
+                line_parts.append(span_text)
+                if "金曜日" in span_text or "20" in span_text or "２０" in span_text:
+                    print(
+                        "保存後受講日時周辺span："
+                        f"text={span_text!r}／bbox={tuple(span.get('bbox', ()))!r}"
+                    )
+            line_text = _normalize_for_old_text_removal_check("".join(line_parts))
+            if old_text in line_text:
+                return True
+    return False
+
+
 def _old_text_remains(page: Any, spec: ReplacementSpec) -> bool:
     """検索候補とrawdictの双方で変更前文字列が残っていないか確認する。"""
+    if spec.old_text == OLD_GENERAL_SCHEDULE_TEXT:
+        return _old_general_schedule_text_remains(page, spec)
     if search_for_old_text_candidates(page, spec):
         return True
     normalized_candidates = {
