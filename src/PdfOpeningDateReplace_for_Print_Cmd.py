@@ -25,6 +25,9 @@ from typing import Any, Sequence
 
 INPUT_PDF_NAME = "チラシ用_阿波なるとAI塾_編集前の原稿.pdf"
 OUTPUT_PDF_NAME = "チラシ用_阿波なるとAI塾_変更後.pdf"
+IMAGE_OUTPUT_PDF_NAME = "チラシ用_阿波なるとAI塾_変更後_画像版.pdf"
+IMAGE_OUTPUT_PAGE1_PDF_NAME = "チラシ用_阿波なるとAI塾_変更後_画像版p1.pdf"
+IMAGE_OUTPUT_PAGE2_PDF_NAME = "チラシ用_阿波なるとAI塾_変更後_画像版p2.pdf"
 ERROR_FILE_NAME = "チラシ用_阿波なるとAI塾_変更後_error.txt"
 
 ADDRESS_PAGE_INDEX = 0
@@ -76,6 +79,7 @@ MULTILINE_SPACING_STEP = 0.01
 MINIMUM_FOLLOWING_GAP = 4.0
 MULTILINE_MIN_GAP_RATIO = 0.25
 COMPARISON_DPI = 144
+IMAGE_OUTPUT_DPI = 350
 DISPLAY_GROUP_OVERLAP_RATIO = 0.8
 
 
@@ -187,6 +191,23 @@ class DocumentSnapshot:
     protected_text_renderings: tuple[
         tuple[str, tuple[float, float, float, float], int, int, int, int, bytes], ...
     ]
+
+
+@dataclass(frozen=True)
+class RasterizedPage:
+    """画像版PDFの全出力で共有する1ページ分の可逆RGB画像。"""
+
+    page_index: int
+    png_bytes: bytes
+    pixel_width: int
+    pixel_height: int
+    sample_hash: str
+    media_box: tuple[float, float, float, float]
+    crop_box: tuple[float, float, float, float]
+    trim_box: tuple[float, float, float, float]
+    bleed_box: tuple[float, float, float, float]
+    art_box: tuple[float, float, float, float]
+    rotation: int
 
 
 REPLACEMENTS = (
@@ -2179,6 +2200,312 @@ def save_and_validate(
         temporary_path.unlink(missing_ok=True)
 
 
+def find_available_image_output_paths(program_dir: Path) -> tuple[Path, Path, Path]:
+    """画像版3ファイルで共通の未使用連番を確保する。"""
+    base_paths = (
+        program_dir / IMAGE_OUTPUT_PDF_NAME,
+        program_dir / IMAGE_OUTPUT_PAGE1_PDF_NAME,
+        program_dir / IMAGE_OUTPUT_PAGE2_PDF_NAME,
+    )
+    if not any(path.exists() for path in base_paths):
+        return base_paths
+    for number in range(1, 10_000):
+        candidates = tuple(
+            path.with_name(f"{path.stem}_{number:04d}{path.suffix}")
+            for path in base_paths
+        )
+        if not any(path.exists() for path in candidates):
+            return candidates
+    raise ReplacementError(
+        "画像版PDFの未使用連番ファイル名を確保できませんでした。",
+        "画像版3ファイルの連番0001～9999がすべて使用されています。",
+    )
+
+
+def _pixmap_hash(pixmap: Any) -> str:
+    """ピクセル寸法・色成分・画素を含む画像ハッシュを返す。"""
+    header = (
+        f"{pixmap.width}:{pixmap.height}:{pixmap.n}:{pixmap.stride}"
+    ).encode("ascii")
+    return hashlib.sha256(header + bytes(pixmap.samples)).hexdigest()
+
+
+def _rect_values(rect: Any) -> tuple[float, float, float, float]:
+    """PyMuPDFの矩形を保存・比較可能な4要素へ変換する。"""
+    return float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1)
+
+
+def rasterize_output_pdf(pymupdf: Any, output_path: Path) -> tuple[RasterizedPage, ...]:
+    """検証済み文字PDFの全ページをRGB・350 DPIの可逆画像へ変換する。"""
+    try:
+        source_doc = pymupdf.open(output_path)
+    except Exception as exc:
+        raise ReplacementError(
+            "画像版の基準となる文字PDFを開けませんでした。", str(exc)
+        ) from exc
+
+    rasterized_pages: list[RasterizedPage] = []
+    try:
+        if source_doc.page_count != EXPECTED_PAGE_COUNT:
+            raise ReplacementError(
+                "画像版PDFを作成できません。",
+                f"基準文字PDFのページ数：{source_doc.page_count}",
+            )
+        for page_index, page in enumerate(source_doc):
+            if page.rotation != 0:
+                raise ReplacementError(
+                    "画像版PDFでページ回転を安全に再現できません。",
+                    f"対象ページ：{page_index + 1}ページ目／回転：{page.rotation}度",
+                )
+            pixmap = page.get_pixmap(
+                dpi=IMAGE_OUTPUT_DPI,
+                colorspace=pymupdf.csRGB,
+                alpha=False,
+            )
+            if pixmap.n != 3 or pixmap.alpha:
+                raise ReplacementError(
+                    "画像版PDF用のRGB画像を作成できません。",
+                    f"対象ページ：{page_index + 1}ページ目／"
+                    f"色成分数：{pixmap.n}／alpha：{pixmap.alpha}",
+                )
+            expected_width = round(page.rect.width / 72.0 * IMAGE_OUTPUT_DPI)
+            expected_height = round(page.rect.height / 72.0 * IMAGE_OUTPUT_DPI)
+            if (
+                abs(pixmap.width - expected_width) > 1
+                or abs(pixmap.height - expected_height) > 1
+            ):
+                raise ReplacementError(
+                    "画像版PDF用画像のピクセル寸法が不正です。",
+                    f"対象ページ：{page_index + 1}ページ目／"
+                    f"実寸：{pixmap.width}x{pixmap.height}／"
+                    f"期待値：{expected_width}x{expected_height}",
+                )
+            rasterized_pages.append(
+                RasterizedPage(
+                    page_index,
+                    bytes(pixmap.tobytes("png")),
+                    pixmap.width,
+                    pixmap.height,
+                    _pixmap_hash(pixmap),
+                    _rect_values(page.mediabox),
+                    _rect_values(page.cropbox),
+                    _rect_values(page.trimbox),
+                    _rect_values(page.bleedbox),
+                    _rect_values(page.artbox),
+                    int(page.rotation),
+                )
+            )
+            print(
+                f"画像化 {page_index + 1}ページ目："
+                f"{pixmap.width}x{pixmap.height}px／RGB／{IMAGE_OUTPUT_DPI} DPI"
+            )
+    finally:
+        source_doc.close()
+    return tuple(rasterized_pages)
+
+
+def _set_image_page_boxes(pymupdf: Any, page: Any, raster: RasterizedPage) -> None:
+    """画像ページへ基準文字PDFと同じページボックスを設定する。"""
+    try:
+        page.set_mediabox(pymupdf.Rect(raster.media_box))
+        page.set_cropbox(pymupdf.Rect(raster.crop_box))
+        page.set_trimbox(pymupdf.Rect(raster.trim_box))
+        page.set_bleedbox(pymupdf.Rect(raster.bleed_box))
+        page.set_artbox(pymupdf.Rect(raster.art_box))
+        page.set_rotation(raster.rotation)
+    except Exception as exc:
+        raise ReplacementError(
+            "画像版PDFへ元のページボックスを設定できませんでした。",
+            f"対象ページ：{raster.page_index + 1}ページ目／詳細：{exc}",
+        ) from exc
+
+
+def _save_image_pdf(
+    pymupdf: Any,
+    temporary_path: Path,
+    rasterized_pages: Sequence[RasterizedPage],
+) -> None:
+    """指定された可逆画像だけを配置したフォントなしPDFを一時保存する。"""
+    image_doc = pymupdf.open()
+    try:
+        for raster in rasterized_pages:
+            media_width = raster.media_box[2] - raster.media_box[0]
+            media_height = raster.media_box[3] - raster.media_box[1]
+            page = image_doc.new_page(width=media_width, height=media_height)
+            _set_image_page_boxes(pymupdf, page, raster)
+            page.insert_image(
+                page.rect,
+                stream=raster.png_bytes,
+                keep_proportion=False,
+                overlay=True,
+            )
+        image_doc.save(temporary_path, garbage=4, deflate=True)
+    except ReplacementError:
+        raise
+    except Exception as exc:
+        raise ReplacementError("画像版PDFを保存できませんでした。", str(exc)) from exc
+    finally:
+        image_doc.close()
+
+
+def _rect_values_match(
+    actual: tuple[float, float, float, float],
+    expected: tuple[float, float, float, float],
+) -> bool:
+    """PDF保存時の微小な座標丸めを許容して矩形を比較する。"""
+    return all(abs(left - right) <= 0.001 for left, right in zip(actual, expected))
+
+
+def validate_image_pdf(
+    pymupdf: Any,
+    image_pdf_path: Path,
+    expected_pages: Sequence[RasterizedPage],
+) -> None:
+    """画像版PDFのページ、画像、フォント不在、見た目を検証する。"""
+    try:
+        image_doc = pymupdf.open(image_pdf_path)
+    except Exception as exc:
+        raise ReplacementError("画像版PDFを開き直せませんでした。", str(exc)) from exc
+    try:
+        if image_doc.needs_pass or image_doc.is_encrypted:
+            raise ReplacementError("画像版PDFが暗号化されています。")
+        if image_doc.page_count != len(expected_pages):
+            raise ReplacementError(
+                "画像版PDFのページ数が不正です。",
+                f"実際：{image_doc.page_count}／期待：{len(expected_pages)}",
+            )
+        for output_index, raster in enumerate(expected_pages):
+            page = image_doc[output_index]
+            box_pairs = (
+                ("MediaBox", _rect_values(page.mediabox), raster.media_box),
+                ("CropBox", _rect_values(page.cropbox), raster.crop_box),
+                ("TrimBox", _rect_values(page.trimbox), raster.trim_box),
+                ("BleedBox", _rect_values(page.bleedbox), raster.bleed_box),
+                ("ArtBox", _rect_values(page.artbox), raster.art_box),
+            )
+            for label, actual, expected in box_pairs:
+                if not _rect_values_match(actual, expected):
+                    raise ReplacementError(
+                        "画像版PDFのページボックスが変わっています。",
+                        f"出力{output_index + 1}ページ目／{label}／"
+                        f"実際：{actual}／期待：{expected}",
+                    )
+            if page.rotation != raster.rotation:
+                raise ReplacementError(
+                    "画像版PDFのページ回転が変わっています。",
+                    f"出力{output_index + 1}ページ目",
+                )
+            fonts = tuple(page.get_fonts(full=True))
+            if fonts:
+                raise ReplacementError(
+                    "画像版PDFにフォントリソースが残っています。",
+                    f"出力{output_index + 1}ページ目／フォント数：{len(fonts)}",
+                )
+            if page.get_text().strip():
+                raise ReplacementError(
+                    "画像版PDFに選択可能なテキストが残っています。",
+                    f"出力{output_index + 1}ページ目",
+                )
+            images = tuple(page.get_images(full=True))
+            if len(images) != 1:
+                raise ReplacementError(
+                    "画像版PDFのページ画像数が不正です。",
+                    f"出力{output_index + 1}ページ目／画像数：{len(images)}",
+                )
+            image_xref = int(images[0][0])
+            image_rectangles = tuple(page.get_image_rects(image_xref))
+            if len(image_rectangles) != 1 or not _rect_values_match(
+                _rect_values(image_rectangles[0]), _rect_values(page.rect)
+            ):
+                raise ReplacementError(
+                    "画像版PDFの画像がページ全面へ配置されていません。",
+                    f"出力{output_index + 1}ページ目",
+                )
+            extracted_image = image_doc.extract_image(image_xref)
+            extracted_bytes = bytes(extracted_image.get("image", b""))
+            if not extracted_bytes:
+                raise ReplacementError(
+                    "画像版PDFからページ画像を抽出できません。",
+                    f"出力{output_index + 1}ページ目",
+                )
+            extracted_pixmap = pymupdf.Pixmap(extracted_bytes)
+            if (
+                extracted_pixmap.width,
+                extracted_pixmap.height,
+                extracted_pixmap.n,
+            ) != (raster.pixel_width, raster.pixel_height, 3) or _pixmap_hash(
+                extracted_pixmap
+            ) != raster.sample_hash:
+                raise ReplacementError(
+                    "画像版PDF内の画像が基準画像と一致しません。",
+                    f"出力{output_index + 1}ページ目／"
+                    f"基準ページ：{raster.page_index + 1}ページ目",
+                )
+            pixmap = page.get_pixmap(
+                dpi=IMAGE_OUTPUT_DPI,
+                colorspace=pymupdf.csRGB,
+                alpha=False,
+            )
+            if (pixmap.width, pixmap.height) != (
+                raster.pixel_width,
+                raster.pixel_height,
+            ):
+                raise ReplacementError(
+                    "画像版PDFのレンダリング寸法が基準文字PDFと一致しません。",
+                    f"出力{output_index + 1}ページ目／"
+                    f"基準ページ：{raster.page_index + 1}ページ目",
+                )
+    finally:
+        image_doc.close()
+
+
+def create_image_output_pdfs(
+    pymupdf: Any,
+    output_path: Path,
+    program_dir: Path,
+) -> tuple[Path, Path, Path]:
+    """検証済み文字PDFからRGB・350 DPIの画像版3ファイルを原子的に作る。"""
+    final_paths = find_available_image_output_paths(program_dir)
+    temporary_paths = tuple(
+        path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp.pdf")
+        for path in final_paths
+    )
+    rasterized_pages = rasterize_output_pdf(pymupdf, output_path)
+    if len(rasterized_pages) != EXPECTED_PAGE_COUNT:
+        raise ReplacementError("画像版PDF用の2ページ画像を作成できませんでした。")
+
+    page_sets = (
+        rasterized_pages,
+        (rasterized_pages[0],),
+        (rasterized_pages[1],),
+    )
+    committed_paths: list[Path] = []
+    try:
+        for temporary_path, pages in zip(temporary_paths, page_sets):
+            _save_image_pdf(pymupdf, temporary_path, pages)
+        for temporary_path, pages in zip(temporary_paths, page_sets):
+            validate_image_pdf(pymupdf, temporary_path, pages)
+        if any(path.exists() for path in final_paths):
+            raise ReplacementError(
+                "画像版PDFの出力先に別ファイルが作成されたため中止しました。",
+                "既存ファイルは上書きしていません。",
+            )
+        for temporary_path, final_path in zip(temporary_paths, final_paths):
+            temporary_path.replace(final_path)
+            committed_paths.append(final_path)
+    except Exception:
+        for path in committed_paths:
+            path.unlink(missing_ok=True)
+        raise
+    finally:
+        for path in temporary_paths:
+            path.unlink(missing_ok=True)
+
+    for path in final_paths:
+        print(f"画像版PDFファイルサイズ：{path.name}／{path.stat().st_size} bytes")
+    return final_paths
+
+
 def _available_comparison_path(program_dir: Path, phase: str, page_number: int) -> Path:
     """確認画像用の未使用ファイル名を返す。"""
     return find_available_path(program_dir / f"確認用_{phase}_{page_number}ページ目.png")
@@ -2205,6 +2532,12 @@ def write_error_file(program_dir: Path, error: ReplacementError) -> Path | None:
             "処理結果：エラー",
             f"入力PDF：{INPUT_PDF_NAME}",
             "対象ページ：1ページ目、2ページ目",
+            f"画像版PDF：{IMAGE_OUTPUT_PDF_NAME}",
+            f"画像版1ページ目PDF：{IMAGE_OUTPUT_PAGE1_PDF_NAME}",
+            f"画像版2ページ目PDF：{IMAGE_OUTPUT_PAGE2_PDF_NAME}",
+            f"画像版解像度：{IMAGE_OUTPUT_DPI} DPI",
+            "画像版色空間：RGB",
+            "画像版アルファチャンネル：なし",
         ]
         for replacement in REPLACEMENTS:
             lines.extend(
@@ -2265,6 +2598,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         apply_replacements(pymupdf, doc, prepared, moves)
         save_and_validate(pymupdf, doc, output_path, snapshot, prepared, moves)
+        image_output_path, image_page1_path, image_page2_path = (
+            create_image_output_pdfs(pymupdf, output_path, program_dir)
+        )
 
         before_images: tuple[Path, ...] = ()
         after_images: tuple[Path, ...] = ()
@@ -2275,6 +2611,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 after_images = render_comparison_images(output_doc, program_dir, "変更後")
 
         print(f"出力PDF：{output_path.name}")
+        print(f"画像版PDF：{image_output_path.name}")
+        print(f"画像版1ページ目PDF：{image_page1_path.name}")
+        print(f"画像版2ページ目PDF：{image_page2_path.name}")
+        print(f"画像版解像度：{IMAGE_OUTPUT_DPI} DPI")
+        print("画像版色空間：RGB")
         for image_path in before_images + after_images:
             print(f"確認用画像：{image_path.name}")
         print("処理が正常に完了しました。")
