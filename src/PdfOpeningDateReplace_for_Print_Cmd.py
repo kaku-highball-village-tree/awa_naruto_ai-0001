@@ -202,11 +202,9 @@ class RasterizedPage:
     pixel_width: int
     pixel_height: int
     sample_hash: str
-    media_box: tuple[float, float, float, float]
-    crop_box: tuple[float, float, float, float]
-    trim_box: tuple[float, float, float, float]
-    bleed_box: tuple[float, float, float, float]
-    art_box: tuple[float, float, float, float]
+    page_width: float
+    page_height: float
+    normalized_box: tuple[float, float, float, float]
     rotation: int
 
 
@@ -2235,6 +2233,76 @@ def _rect_values(rect: Any) -> tuple[float, float, float, float]:
     return float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1)
 
 
+def _rect_dimensions(
+    values: tuple[float, float, float, float],
+) -> tuple[float, float]:
+    """矩形の原点に依存しない幅と高さを返す。"""
+    return values[2] - values[0], values[3] - values[1]
+
+
+def _dimensions_match(
+    values: tuple[float, float, float, float], width: float, height: float
+) -> bool:
+    """PDF座標の丸めを許容し、矩形がページと同じ物理寸法か確認する。"""
+    actual_width, actual_height = _rect_dimensions(values)
+    return abs(actual_width - width) <= 0.001 and abs(actual_height - height) <= 0.001
+
+
+def _log_source_page_boxes(page_index: int, page: Any) -> None:
+    """画像版へ変換する前の座標系と全ページボックスを記録する。"""
+    print(f"画像版ページボックス調査 {page_index + 1}ページ目：")
+    print(f"  page.rect={_rect_values(page.rect)}")
+    print(f"  page.mediabox={_rect_values(page.mediabox)}")
+    print(f"  page.cropbox={_rect_values(page.cropbox)}")
+    print(f"  page.trimbox={_rect_values(page.trimbox)}")
+    print(f"  page.bleedbox={_rect_values(page.bleedbox)}")
+    print(f"  page.artbox={_rect_values(page.artbox)}")
+    print(f"  page.rotation={page.rotation}")
+    print(f"  page.transformation_matrix={page.transformation_matrix}")
+
+
+def _normalized_image_page_box(
+    pymupdf: Any, page_index: int, page: Any
+) -> tuple[float, float, float, float]:
+    """表示ページ全体を原点(0, 0)へ正規化できることを確認する。"""
+    width = float(page.rect.width)
+    height = float(page.rect.height)
+    source_boxes = (
+        ("MediaBox", _rect_values(page.mediabox)),
+        ("CropBox", _rect_values(page.cropbox)),
+        ("TrimBox", _rect_values(page.trimbox)),
+        ("BleedBox", _rect_values(page.bleedbox)),
+        ("ArtBox", _rect_values(page.artbox)),
+    )
+    different_boxes = tuple(
+        (label, values, _rect_dimensions(values))
+        for label, values in source_boxes
+        if not _dimensions_match(values, width, height)
+    )
+    if different_boxes:
+        details = "／".join(
+            f"{label}={values}（幅x高さ={dimensions[0]}x{dimensions[1]}）"
+            for label, values, dimensions in different_boxes
+        )
+        raise ReplacementError(
+            "画像版PDFのページボックスを安全に正規化できませんでした。",
+            f"対象ページ：{page_index + 1}ページ目／"
+            f"表示ページ寸法：{width}x{height}／"
+            f"表示ページと異なるボックス：{details}",
+        )
+
+    normalized = (0.0, 0.0, width, height)
+    normalized_rect = pymupdf.Rect(normalized)
+    if not normalized_rect.is_valid or normalized_rect.is_empty:
+        raise ReplacementError(
+            "画像版PDFの正規化ページボックスが不正です。",
+            f"対象ページ：{page_index + 1}ページ目／box={normalized}",
+        )
+    print(f"  正規化後MediaBox/CropBox/TrimBox/BleedBox/ArtBox={normalized}")
+    print("  正規化後CropBoxがMediaBoxに含まれるか=True")
+    return normalized
+
+
 def rasterize_output_pdf(pymupdf: Any, output_path: Path) -> tuple[RasterizedPage, ...]:
     """検証済み文字PDFの全ページをRGB・350 DPIの可逆画像へ変換する。"""
     try:
@@ -2252,11 +2320,13 @@ def rasterize_output_pdf(pymupdf: Any, output_path: Path) -> tuple[RasterizedPag
                 f"基準文字PDFのページ数：{source_doc.page_count}",
             )
         for page_index, page in enumerate(source_doc):
+            _log_source_page_boxes(page_index, page)
             if page.rotation != 0:
                 raise ReplacementError(
                     "画像版PDFでページ回転を安全に再現できません。",
                     f"対象ページ：{page_index + 1}ページ目／回転：{page.rotation}度",
                 )
+            normalized_box = _normalized_image_page_box(pymupdf, page_index, page)
             pixmap = page.get_pixmap(
                 dpi=IMAGE_OUTPUT_DPI,
                 colorspace=pymupdf.csRGB,
@@ -2287,11 +2357,9 @@ def rasterize_output_pdf(pymupdf: Any, output_path: Path) -> tuple[RasterizedPag
                     pixmap.width,
                     pixmap.height,
                     _pixmap_hash(pixmap),
-                    _rect_values(page.mediabox),
-                    _rect_values(page.cropbox),
-                    _rect_values(page.trimbox),
-                    _rect_values(page.bleedbox),
-                    _rect_values(page.artbox),
+                    float(page.rect.width),
+                    float(page.rect.height),
+                    normalized_box,
                     int(page.rotation),
                 )
             )
@@ -2305,17 +2373,32 @@ def rasterize_output_pdf(pymupdf: Any, output_path: Path) -> tuple[RasterizedPag
 
 
 def _set_image_page_boxes(pymupdf: Any, page: Any, raster: RasterizedPage) -> None:
-    """画像ページへ基準文字PDFと同じページボックスを設定する。"""
+    """画像ページへ原点を正規化した安全なページボックスを設定する。"""
     try:
-        page.set_mediabox(pymupdf.Rect(raster.media_box))
-        page.set_cropbox(pymupdf.Rect(raster.crop_box))
-        page.set_trimbox(pymupdf.Rect(raster.trim_box))
-        page.set_bleedbox(pymupdf.Rect(raster.bleed_box))
-        page.set_artbox(pymupdf.Rect(raster.art_box))
+        normalized_box = pymupdf.Rect(raster.normalized_box)
+        page.set_mediabox(normalized_box)
+        if not page.mediabox.contains(normalized_box):
+            raise ValueError(
+                f"正規化CropBoxがMediaBoxに含まれません。"
+                f"MediaBox={_rect_values(page.mediabox)}／"
+                f"CropBox={raster.normalized_box}"
+            )
+        page.set_cropbox(normalized_box)
+        page.set_trimbox(normalized_box)
+        page.set_bleedbox(normalized_box)
+        page.set_artbox(normalized_box)
         page.set_rotation(raster.rotation)
+        print(
+            f"画像版 {raster.page_index + 1}ページ目ページボックス設定後："
+            f"MediaBox={_rect_values(page.mediabox)}／"
+            f"CropBox={_rect_values(page.cropbox)}／"
+            f"TrimBox={_rect_values(page.trimbox)}／"
+            f"BleedBox={_rect_values(page.bleedbox)}／"
+            f"ArtBox={_rect_values(page.artbox)}"
+        )
     except Exception as exc:
         raise ReplacementError(
-            "画像版PDFへ元のページボックスを設定できませんでした。",
+            "画像版PDFへ正規化したページボックスを設定できませんでした。",
             f"対象ページ：{raster.page_index + 1}ページ目／詳細：{exc}",
         ) from exc
 
@@ -2329,14 +2412,25 @@ def _save_image_pdf(
     image_doc = pymupdf.open()
     try:
         for raster in rasterized_pages:
-            media_width = raster.media_box[2] - raster.media_box[0]
-            media_height = raster.media_box[3] - raster.media_box[1]
-            page = image_doc.new_page(width=media_width, height=media_height)
+            page = image_doc.new_page(
+                width=raster.page_width, height=raster.page_height
+            )
             _set_image_page_boxes(pymupdf, page, raster)
+            page_ratio = page.rect.width / page.rect.height
+            image_ratio = raster.pixel_width / raster.pixel_height
+            ratio_tolerance = max(
+                1.0 / raster.pixel_width, 1.0 / raster.pixel_height
+            )
+            if abs(page_ratio - image_ratio) > ratio_tolerance:
+                raise ReplacementError(
+                    "画像版PDFのページと画像の縦横比が一致しません。",
+                    f"対象ページ：{raster.page_index + 1}ページ目／"
+                    f"ページ比率：{page_ratio}／画像比率：{image_ratio}",
+                )
             page.insert_image(
                 page.rect,
                 stream=raster.png_bytes,
-                keep_proportion=False,
+                keep_proportion=True,
                 overlay=True,
             )
         image_doc.save(temporary_path, garbage=4, deflate=True)
@@ -2377,11 +2471,11 @@ def validate_image_pdf(
         for output_index, raster in enumerate(expected_pages):
             page = image_doc[output_index]
             box_pairs = (
-                ("MediaBox", _rect_values(page.mediabox), raster.media_box),
-                ("CropBox", _rect_values(page.cropbox), raster.crop_box),
-                ("TrimBox", _rect_values(page.trimbox), raster.trim_box),
-                ("BleedBox", _rect_values(page.bleedbox), raster.bleed_box),
-                ("ArtBox", _rect_values(page.artbox), raster.art_box),
+                ("MediaBox", _rect_values(page.mediabox), raster.normalized_box),
+                ("CropBox", _rect_values(page.cropbox), raster.normalized_box),
+                ("TrimBox", _rect_values(page.trimbox), raster.normalized_box),
+                ("BleedBox", _rect_values(page.bleedbox), raster.normalized_box),
+                ("ArtBox", _rect_values(page.artbox), raster.normalized_box),
             )
             for label, actual, expected in box_pairs:
                 if not _rect_values_match(actual, expected):
@@ -2390,6 +2484,13 @@ def validate_image_pdf(
                         f"出力{output_index + 1}ページ目／{label}／"
                         f"実際：{actual}／期待：{expected}",
                     )
+            if not page.mediabox.contains(page.cropbox):
+                raise ReplacementError(
+                    "画像版PDFのCropBoxがMediaBoxに含まれていません。",
+                    f"出力{output_index + 1}ページ目／"
+                    f"MediaBox={_rect_values(page.mediabox)}／"
+                    f"CropBox={_rect_values(page.cropbox)}",
+                )
             if page.rotation != raster.rotation:
                 raise ReplacementError(
                     "画像版PDFのページ回転が変わっています。",
