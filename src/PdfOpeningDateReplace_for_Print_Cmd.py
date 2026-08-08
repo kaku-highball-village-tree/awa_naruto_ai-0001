@@ -2427,10 +2427,19 @@ def _save_image_pdf(
                     f"対象ページ：{raster.page_index + 1}ページ目／"
                     f"ページ比率：{page_ratio}／画像比率：{image_ratio}",
                 )
+            print(
+                f"画像版 {raster.page_index + 1}ページ目画像配置："
+                f"page.rect={_rect_values(page.rect)}／"
+                f"画像サイズ={raster.pixel_width}x{raster.pixel_height}px／"
+                f"ページ縦横比={page_ratio}／画像縦横比={image_ratio}／"
+                f"縦横比差={abs(page_ratio - image_ratio)}／"
+                f"許容値={ratio_tolerance}／keep_proportion=False／"
+                f"挿入先rect={_rect_values(page.rect)}"
+            )
             page.insert_image(
                 page.rect,
                 stream=raster.png_bytes,
-                keep_proportion=True,
+                keep_proportion=False,
                 overlay=True,
             )
         image_doc.save(temporary_path, garbage=4, deflate=True)
@@ -2515,8 +2524,26 @@ def validate_image_pdf(
                 )
             image_xref = int(images[0][0])
             image_rectangles = tuple(page.get_image_rects(image_xref))
+            actual_image_rects = tuple(
+                _rect_values(rect) for rect in image_rectangles
+            )
+            expected_image_rect = _rect_values(page.rect)
+            image_rect_differences = tuple(
+                tuple(
+                    actual_value - expected_value
+                    for actual_value, expected_value in zip(
+                        actual_rect, expected_image_rect
+                    )
+                )
+                for actual_rect in actual_image_rects
+            )
+            print(
+                f"画像版 {output_index + 1}ページ目保存後画像bbox："
+                f"実際={actual_image_rects}／期待={expected_image_rect}／"
+                f"差={image_rect_differences}"
+            )
             if len(image_rectangles) != 1 or not _rect_values_match(
-                _rect_values(image_rectangles[0]), _rect_values(page.rect)
+                _rect_values(image_rectangles[0]), expected_image_rect
             ):
                 raise ReplacementError(
                     "画像版PDFの画像がページ全面へ配置されていません。",
