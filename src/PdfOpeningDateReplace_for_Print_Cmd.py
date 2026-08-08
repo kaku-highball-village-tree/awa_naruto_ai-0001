@@ -1214,6 +1214,22 @@ def _find_closest_group_below(page: Any, text: str, reference_rect: Any) -> Sear
     return candidates[0]
 
 
+def _is_general_schedule_heading_candidate(
+    page: Any, candidate_rect: Any, opening_rect: Any
+) -> bool:
+    """同じ段の2見出しから、右側の一般コース見出しだけを判定する。"""
+    page_center_x = page.rect.x0 + page.rect.width / 2.0
+    candidate_center_x = (candidate_rect.x0 + candidate_rect.x1) / 2.0
+    candidate_center_y = (candidate_rect.y0 + candidate_rect.y1) / 2.0
+    opening_center_y = (opening_rect.y0 + opening_rect.y1) / 2.0
+    return (
+        candidate_rect.x1 < opening_rect.x0
+        and candidate_center_x > page_center_x
+        and abs(candidate_center_y - opening_center_y)
+        <= max(candidate_rect.height, opening_rect.height)
+    )
+
+
 def prepare_general_schedule_heading_move(
     pymupdf: Any,
     doc: Any,
@@ -1238,12 +1254,29 @@ def prepare_general_schedule_heading_move(
     heading_groups = group_overlapping_rectangles(
         tuple(page.search_for(GENERAL_SCHEDULE_HEADING_TEXT))
     )
+    page_center_x = page.rect.x0 + page.rect.width / 2.0
+    opening_center_y = (
+        opening_date.style.bbox.y0 + opening_date.style.bbox.y1
+    ) / 2.0
+    for index, group in enumerate(heading_groups, start=1):
+        candidate_rect = group.union_rect
+        candidate_center_x = (candidate_rect.x0 + candidate_rect.x1) / 2.0
+        candidate_center_y = (candidate_rect.y0 + candidate_rect.y1) / 2.0
+        horizontal_gap = opening_date.style.bbox.x0 - candidate_rect.x1
+        vertical_center_gap = abs(candidate_center_y - opening_center_y)
+        print(f"受講日時見出し候補 {index}：bbox={tuple(candidate_rect)}")
+        print(
+            f"  中心X={candidate_center_x}／中心Y={candidate_center_y}／"
+            f"開講日までの水平距離={horizontal_gap}／"
+            f"Y方向中心差={vertical_center_gap}／"
+            f"ページ右半分={candidate_center_x > page_center_x}"
+        )
     heading_candidates = [
         group
         for group in heading_groups
-        if group.union_rect.x1 < opening_date.style.bbox.x0
-        and abs(group.union_rect.y0 - opening_date.style.bbox.y0)
-        <= max(group.union_rect.height, opening_date.style.bbox.height)
+        if _is_general_schedule_heading_candidate(
+            page, group.union_rect, opening_date.style.bbox
+        )
     ]
     if len(heading_candidates) != 1:
         raise ReplacementError(
@@ -1953,6 +1986,20 @@ def validate_output_pdf(
                     f"移動後の文字列「{move.text}」を確認できません。",
                 )
             if move.text == GENERAL_SCHEDULE_HEADING_TEXT:
+                page_center_x = page.rect.x0 + page.rect.width / 2.0
+                child_heading_groups = [
+                    group
+                    for group in groups
+                    if (group.union_rect.x0 + group.union_rect.x1) / 2.0
+                    <= page_center_x
+                ]
+                if len(groups) != 2 or len(child_heading_groups) != 1:
+                    raise ReplacementError(
+                        "保存後の検証に失敗しました。",
+                        "児童・一般コースの受講日時見出し2件を確認できません。"
+                        f"（全表示グループ数：{len(groups)}件／"
+                        f"児童コース側：{len(child_heading_groups)}件）",
+                    )
                 old_position_groups = [
                     group
                     for group in groups
