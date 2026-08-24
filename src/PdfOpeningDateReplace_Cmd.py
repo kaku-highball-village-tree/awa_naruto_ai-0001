@@ -818,51 +818,78 @@ def _find_closest_group_below(page: Any, text: str, reference_rect: Any) -> Sear
     return candidates[0]
 
 
-def _is_general_schedule_heading_candidate(
-    page: Any, candidate_rect: Any, opening_rect: Any
-) -> bool:
-    """同じ段の2見出しから、右側の一般コース見出しだけを判定する。"""
-    page_center_x = page.rect.x0 + page.rect.width / 2.0
-    candidate_center_x = (candidate_rect.x0 + candidate_rect.x1) / 2.0
-    candidate_center_y = (candidate_rect.y0 + candidate_rect.y1) / 2.0
+def _select_general_schedule_heading(
+    heading_groups: Sequence[SearchGroup], opening_rect: Any, schedule_rect: Any
+) -> SearchGroup:
+    """2見出しから一般コースにY方向が最も近い候補を返す。"""
+    if len(heading_groups) != 2:
+        raise ReplacementError(
+            "一般コースの受講日時見出しを一意に特定できません。",
+            f"全表示グループ数：{len(heading_groups)}件（必要：2件）",
+        )
+
     opening_center_y = (opening_rect.y0 + opening_rect.y1) / 2.0
-    return (
-        candidate_rect.x1 < opening_rect.x0
-        and candidate_center_x > page_center_x
-        and abs(candidate_center_y - opening_center_y)
-        <= max(candidate_rect.height, opening_rect.height)
-    )
+    schedule_center_y = (schedule_rect.y0 + schedule_rect.y1) / 2.0
+    ranked: list[tuple[float, float, SearchGroup]] = []
+    for number, group in enumerate(heading_groups, start=1):
+        rect = group.union_rect
+        if rect.get_area() <= 0:
+            raise ReplacementError(
+                "一般コースの受講日時見出しの矩形が不正です。",
+                f"候補：{number}／bbox：{tuple(rect)}",
+            )
+        center_x = (rect.x0 + rect.x1) / 2.0
+        center_y = (rect.y0 + rect.y1) / 2.0
+        opening_distance = abs(center_y - opening_center_y)
+        schedule_distance = abs(center_y - schedule_center_y)
+        print(f"受講日時見出し候補 {number}：bbox={tuple(rect)}")
+        print(
+            f"  中心X={center_x}／中心Y={center_y}／"
+            f"開講日との中心Y距離={opening_distance}／"
+            f"受講日時本文との中心Y距離={schedule_distance}"
+        )
+        ranked.append((opening_distance, schedule_distance, group))
+
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    distance_gap = ranked[1][0] - ranked[0][0]
+    if distance_gap <= 1.0:
+        raise ReplacementError(
+            "一般コースの受講日時見出しを一意に特定できません。",
+            f"開講日との中心Y距離差：{distance_gap}／必要：1.0より大きい値",
+        )
+    selected = ranked[0][2]
+    selected_center_y = (selected.union_rect.y0 + selected.union_rect.y1) / 2.0
+    if selected_center_y >= schedule_center_y:
+        raise ReplacementError(
+            "一般コースの受講日時見出しが受講日時本文より上にありません。",
+            f"見出し中心Y：{selected_center_y}／本文中心Y：{schedule_center_y}",
+        )
+    print(f"一般コース受講日時見出しの中心Y距離差：{distance_gap}")
+    return selected
 
 
 def validate_general_schedule_heading_position(
     pymupdf: Any,
     doc: Any,
     replacements: Sequence[PreparedReplacement],
-) -> None:
+) -> Any:
     """一般コースの受講日時見出しを特定し、元位置で安全か確認する。"""
     opening_date = next(
         item
         for item in replacements
         if item.spec.old_text == OLD_GENERAL_OPENING_DATE_TEXT
     )
+    schedule = next(
+        item for item in replacements if item.spec.old_text == OLD_GENERAL_SCHEDULE_TEXT
+    )
     page = doc[OPENING_DATE_PAGE_INDEX]
     heading_groups = group_overlapping_rectangles(
         tuple(page.search_for(GENERAL_SCHEDULE_HEADING_TEXT))
     )
-    candidates = [
-        group
-        for group in heading_groups
-        if _is_general_schedule_heading_candidate(
-            page, group.union_rect, opening_date.style.bbox
-        )
-    ]
-    if len(heading_groups) != 2 or len(candidates) != 1:
-        raise ReplacementError(
-            "一般コースの受講日時見出しを一意に特定できません。",
-            f"全表示グループ数：{len(heading_groups)}件／"
-            f"一般コース候補数：{len(candidates)}件",
-        )
-    heading_rect = candidates[0].union_rect
+    selected = _select_general_schedule_heading(
+        heading_groups, opening_date.style.bbox, schedule.style.bbox
+    )
+    heading_rect = selected.union_rect
     opening_rectangles = _planned_line_rectangles(pymupdf, opening_date)
     if any(heading_rect.intersects(rect) for rect in opening_rectangles):
         raise ReplacementError(
@@ -870,6 +897,7 @@ def validate_general_schedule_heading_position(
         )
     print(f"一般コース受講日時見出しbbox：{tuple(heading_rect)}")
     print("一般コース受講日時見出しは元位置を維持します。\n")
+    return heading_rect
 
 
 def prepare_following_line_moves(
@@ -1321,6 +1349,7 @@ def validate_output_pdf(
     snapshot: DocumentSnapshot,
     prepared: Sequence[PreparedReplacement],
     moves: Sequence[PreparedMove],
+    original_heading_rect: Any,
 ) -> None:
     """保存PDFを開き直し、置換結果と対象外ページを検証する。"""
     try:
@@ -1398,19 +1427,28 @@ def validate_output_pdf(
         heading_groups = group_overlapping_rectangles(
             tuple(general_page.search_for(GENERAL_SCHEDULE_HEADING_TEXT))
         )
-        heading_candidates = [
-            group
-            for group in heading_groups
-            if _is_general_schedule_heading_candidate(
-                general_page, group.union_rect, general_opening.style.bbox
+        try:
+            heading_group = _select_general_schedule_heading(
+                heading_groups,
+                general_opening.style.bbox,
+                general_schedule.style.bbox,
             )
-        ]
-        if len(heading_groups) != 2 or len(heading_candidates) != 1:
+        except ReplacementError as exc:
             raise ReplacementError(
                 "保存後の検証に失敗しました。",
-                "児童・一般コースの受講日時見出しを期待位置で確認できません。",
+                f"一般コース受講日時見出し：{exc.message}／{exc.detail}",
+            ) from exc
+        heading_rect = heading_group.union_rect
+        if any(
+            abs(actual - expected) > 0.5
+            for actual, expected in zip(tuple(heading_rect), tuple(original_heading_rect))
+        ):
+            raise ReplacementError(
+                "保存後の検証に失敗しました。",
+                "一般コース受講日時見出しの位置が変わっています。"
+                f"（保存前：{tuple(original_heading_rect)}／"
+                f"保存後：{tuple(heading_rect)}）",
             )
-        heading_rect = heading_candidates[0].union_rect
         if (
             len(opening_rectangles) != 2
             or opening_rectangles[0].y0 >= opening_rectangles[1].y0
@@ -1508,6 +1546,7 @@ def save_and_validate(
     snapshot: DocumentSnapshot,
     prepared: Sequence[PreparedReplacement],
     moves: Sequence[PreparedMove],
+    original_heading_rect: Any,
 ) -> None:
     """最適化せず一時保存し、検証成功後だけ正式名へ変更する。"""
     temporary_path = output_path.with_name(
@@ -1515,7 +1554,14 @@ def save_and_validate(
     )
     try:
         doc.save(temporary_path)
-        validate_output_pdf(pymupdf, temporary_path, snapshot, prepared, moves)
+        validate_output_pdf(
+            pymupdf,
+            temporary_path,
+            snapshot,
+            prepared,
+            moves,
+            original_heading_rect,
+        )
         temporary_path.replace(output_path)
     except ReplacementError:
         raise
@@ -1586,12 +1632,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"入力PDF：{input_path.name}")
         doc = open_pdf(pymupdf, input_path)
         prepared = prepare_replacements(pymupdf, doc)
-        validate_general_schedule_heading_position(pymupdf, doc, prepared)
+        general_schedule_heading_rect = validate_general_schedule_heading_position(
+            pymupdf, doc, prepared
+        )
         moves = prepare_following_line_moves(pymupdf, doc, prepared)
         snapshot = snapshot_document(doc)
 
         apply_replacements(pymupdf, doc, prepared, moves)
-        save_and_validate(pymupdf, doc, output_path, snapshot, prepared, moves)
+        save_and_validate(
+            pymupdf,
+            doc,
+            output_path,
+            snapshot,
+            prepared,
+            moves,
+            general_schedule_heading_rect,
+        )
 
         before_images: tuple[Path, ...] = ()
         after_images: tuple[Path, ...] = ()
