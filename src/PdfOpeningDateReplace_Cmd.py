@@ -40,6 +40,7 @@ GENERAL_DESCRIPTION_LAST_LINE_TEXT = "つける事が大切です。"
 YOUTH_COURSE_HEADING_TEXT = "Youth Course"
 GENERAL_COURSE_HEADING_TEXT = "General Course"
 COURSE_GAP_TOLERANCE = 0.5
+MINIMUM_GENERAL_DESCRIPTION_GAP = 2.0
 
 OLD_GENERAL_SCHEDULE_TEXT = "第１・第２金曜日　１８：３０～２０：３０"
 NEW_GENERAL_SCHEDULE_LINES = (
@@ -705,7 +706,7 @@ def prepare_general_description_spacing(pymupdf: Any, doc: Any) -> GeneralDescri
             "コース見出しと説明文の間隔が不正です。",
             f"Youth Course：{youth_gap}／General Course：{general_gap}",
         )
-    upward_offset = max(0.0, general_gap - youth_gap)
+    upward_offset = max(0.0, general_gap - MINIMUM_GENERAL_DESCRIPTION_GAP)
     description_texts = tuple(
         str(span.get("text", ""))
         for _, _, spans in general_lines
@@ -770,6 +771,7 @@ def prepare_general_description_spacing(pymupdf: Any, doc: Any) -> GeneralDescri
     print(f"General Course見出しbbox：{tuple(general_heading)}")
     print(f"一般コース説明文1行目bbox：{tuple(general_lines[0][1])}")
     print(f"General Course現在間隔：{general_gap}")
+    print(f"General Course最低安全間隔：{MINIMUM_GENERAL_DESCRIPTION_GAP}")
     print(f"一般コース説明文の上方向移動量：{upward_offset}\n")
     return GeneralDescriptionPlan(
         tuple(moves),
@@ -1085,49 +1087,102 @@ def prepare_following_line_moves(
     doc: Any,
     replacements: Sequence[PreparedReplacement],
 ) -> tuple[PreparedMove, ...]:
-    """2行目と重なる場合だけ、一般コースの後続行を同量だけ下へ移動する。"""
+    """全2回行と受講料行を別グループとして必要最小限だけ下へ移動する。"""
     schedule = next(
         item for item in replacements if item.spec.old_text == OLD_GENERAL_SCHEDULE_TEXT
     )
     page = doc[schedule.spec.page_index]
-    first_group = _find_closest_group_below(
-        page, GENERAL_MOVABLE_TEXTS[0], schedule.style.bbox
-    )
-    minimum_gap = max(
-        MINIMUM_FOLLOWING_GAP,
-        schedule.font_size * MULTILINE_MIN_GAP_RATIO,
-    )
-    required_top = schedule.changed_rect.y1 + minimum_gap
-    y_offset = max(0.0, required_top - first_group.union_rect.y0)
-    if y_offset <= 0:
-        return ()
-
-    moves: list[PreparedMove] = []
     ignored_texts = set(GENERAL_MOVABLE_TEXTS)
     ignored_texts.update(spec.old_text for spec in REPLACEMENTS)
     normalized_ignored_texts = {
         normalize_whitespace_for_comparison(text) for text in ignored_texts
     }
+
+    prepared_rows: dict[str, tuple[TextStyle, tuple[Any, ...], Path]] = {}
     for text in GENERAL_MOVABLE_TEXTS:
         group = _find_closest_group_below(page, text, schedule.style.bbox)
-        move_spec = ReplacementSpec(f"一般コース後続行「{text}」", 2, text, (text,))
+        move_spec = ReplacementSpec(
+            f"一般コース後続行「{text}」",
+            schedule.spec.page_index,
+            text,
+            (text,),
+        )
         style, deletion_rectangles = get_original_text_style(page, group, move_spec)
-        font_path = find_japanese_font(style, move_spec)
+        prepared_rows[text] = (
+            style,
+            deletion_rectangles,
+            find_japanese_font(style, move_spec),
+        )
+
+    count_style = prepared_rows[GENERAL_MOVABLE_TEXTS[0]][0]
+    fee_style = prepared_rows[GENERAL_MOVABLE_TEXTS[1]][0]
+    price_style = prepared_rows[GENERAL_MOVABLE_TEXTS[2]][0]
+    fee_center_y = (fee_style.bbox.y0 + fee_style.bbox.y1) / 2.0
+    price_center_y = (price_style.bbox.y0 + price_style.bbox.y1) / 2.0
+    fee_row_tolerance = max(fee_style.bbox.height, price_style.bbox.height) * 0.5
+    if abs(fee_center_y - price_center_y) > fee_row_tolerance:
+        raise ReplacementError(
+            "受講料と料金を同じ行として確認できません。",
+            f"受講料中心Y：{fee_center_y}／料金中心Y：{price_center_y}／"
+            f"許容差：{fee_row_tolerance}",
+        )
+
+    minimum_schedule_gap = max(
+        MINIMUM_FOLLOWING_GAP,
+        schedule.font_size * MULTILINE_MIN_GAP_RATIO,
+    )
+    count_offset = max(
+        0.0, schedule.changed_rect.y1 + minimum_schedule_gap - count_style.bbox.y0
+    )
+    moved_count_rect = count_style.bbox.__class__(
+        count_style.bbox.x0,
+        count_style.bbox.y0 + count_offset,
+        count_style.bbox.x1,
+        count_style.bbox.y1 + count_offset,
+    )
+    minimum_fee_gap = max(
+        MINIMUM_FOLLOWING_GAP,
+        count_style.size * MULTILINE_MIN_GAP_RATIO,
+    )
+    fee_row_top = min(fee_style.bbox.y0, price_style.bbox.y0)
+    fee_row_offset = max(
+        0.0, moved_count_rect.y1 + minimum_fee_gap - fee_row_top
+    )
+    offsets = {
+        GENERAL_MOVABLE_TEXTS[0]: count_offset,
+        GENERAL_MOVABLE_TEXTS[1]: fee_row_offset,
+        GENERAL_MOVABLE_TEXTS[2]: fee_row_offset,
+    }
+
+    moves: list[PreparedMove] = []
+    for text in GENERAL_MOVABLE_TEXTS:
+        style, deletion_rectangles, font_path = prepared_rows[text]
+        y_offset = offsets[text]
+        if y_offset <= 0:
+            continue
         new_rect = style.bbox.__class__(
             style.bbox.x0,
             style.bbox.y0 + y_offset,
             style.bbox.x1,
             style.bbox.y1 + y_offset,
         )
+        print(
+            f"一般コース後続行予定bbox：{text}／"
+            f"移動前={tuple(style.bbox)}／移動後={tuple(new_rect)}／"
+            f"ページ={tuple(page.rect)}"
+        )
         if not page.rect.contains(new_rect):
+            overflow = max(0.0, new_rect.y1 - page.rect.y1)
             raise ReplacementError(
-                "一般コースの後続行を欄内へ移動できません。",
-                f"移動対象：{text}",
+                "一般コースの後続行をページ内へ移動できません。",
+                f"移動対象：{text}／Y移動量：{y_offset}／"
+                f"移動後下端：{new_rect.y1}／ページ下端：{page.rect.y1}／"
+                f"超過量：{overflow}",
             )
         if _crosses_new_graphics(page, style.bbox, new_rect):
             raise ReplacementError(
                 "一般コースの後続行が背景線または図形へ重なるため移動できません。",
-                f"移動対象：{text}",
+                f"移動対象：{text}／移動後bbox：{tuple(new_rect)}",
             )
         for block in page.get_text("dict").get("blocks", []):
             for line in block.get("lines", []):
@@ -1156,8 +1211,11 @@ def prepare_following_line_moves(
                 style.bbox | new_rect,
             )
         )
-    print(f"一般コース後続行のY方向移動量：{y_offset}")
-    print(f"一般コース受講日時と後続行の最低余白：{minimum_gap}")
+
+    print(f"全2回行のY方向移動量：{count_offset}")
+    print(f"受講料行の共通Y方向移動量：{fee_row_offset}")
+    print(f"受講日時と全2回行の最低余白：{minimum_schedule_gap}")
+    print(f"全2回行と受講料行の最低余白：{minimum_fee_gap}\n")
     return tuple(moves)
 
 
@@ -1603,15 +1661,38 @@ def validate_output_pdf(
                     "保存後の検証に失敗しました。",
                     f"移動前の文字列「{move.text}」が残っています。",
                 )
-        general_opening = next(
-            item
-            for item in prepared
-            if item.spec.old_text == OLD_GENERAL_OPENING_DATE_TEXT
-        )
+
         general_schedule = next(
             item
             for item in prepared
             if item.spec.old_text == OLD_GENERAL_SCHEDULE_TEXT
+        )
+        fee_group = _find_closest_group_below(
+            output_doc[OPENING_DATE_PAGE_INDEX],
+            GENERAL_MOVABLE_TEXTS[1],
+            general_schedule.style.bbox,
+        )
+        price_group = _find_closest_group_below(
+            output_doc[OPENING_DATE_PAGE_INDEX],
+            GENERAL_MOVABLE_TEXTS[2],
+            general_schedule.style.bbox,
+        )
+        fee_center_y = (fee_group.union_rect.y0 + fee_group.union_rect.y1) / 2.0
+        price_center_y = (price_group.union_rect.y0 + price_group.union_rect.y1) / 2.0
+        fee_row_tolerance = max(
+            fee_group.union_rect.height, price_group.union_rect.height
+        ) * 0.5
+        if abs(fee_center_y - price_center_y) > fee_row_tolerance:
+            raise ReplacementError(
+                "保存後の検証に失敗しました。",
+                "受講料と料金が同じ論理行にありません。"
+                f"（中心Y差：{abs(fee_center_y - price_center_y)}／"
+                f"許容差：{fee_row_tolerance}）",
+            )
+        general_opening = next(
+            item
+            for item in prepared
+            if item.spec.old_text == OLD_GENERAL_OPENING_DATE_TEXT
         )
         general_page = output_doc[OPENING_DATE_PAGE_INDEX]
         opening_rectangles = _planned_line_rectangles(pymupdf, general_opening)
@@ -1716,12 +1797,19 @@ def validate_output_pdf(
             - description_plan.upward_offset,
         )
         saved_general_gap = moved_first_line_rect.y0 - general_course_heading.y1
-        if abs(saved_general_gap - description_plan.youth_gap) > COURSE_GAP_TOLERANCE:
+        planned_general_gap = (
+            description_plan.original_gap - description_plan.upward_offset
+        )
+        if (
+            saved_general_gap < MINIMUM_GENERAL_DESCRIPTION_GAP
+            or abs(saved_general_gap - planned_general_gap) > COURSE_GAP_TOLERANCE
+        ):
             raise ReplacementError(
                 "保存後の検証に失敗しました。",
                 "General Course見出しと説明文の間隔が"
-                f"Youth Courseと一致しません。（実際：{saved_general_gap}／"
-                f"期待：{description_plan.youth_gap}）",
+                f"計画と一致しません。（実際：{saved_general_gap}／"
+                f"期待：{planned_general_gap}／"
+                f"最低：{MINIMUM_GENERAL_DESCRIPTION_GAP}）",
             )
 
         if not output_doc[OPENING_DATE_PAGE_INDEX].search_for(REQUIRED_WEEKLY_TEXT):
