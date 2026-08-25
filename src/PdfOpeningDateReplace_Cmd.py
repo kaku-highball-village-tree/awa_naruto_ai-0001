@@ -82,6 +82,7 @@ class ReplacementError(Exception):
         super().__init__(message)
         self.message = message
         self.detail = detail
+        self.error_pdf_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -1864,21 +1865,41 @@ def save_and_validate(
     original_heading_rect: Any,
     description_plan: GeneralDescriptionPlan,
 ) -> None:
-    """最適化せず一時保存し、検証成功後だけ正式名へ変更する。"""
+    """一時保存を検証し、失敗時は確認用_error PDFとして残す。"""
     temporary_path = output_path.with_name(
         f".{output_path.name}.{uuid.uuid4().hex}.tmp.pdf"
     )
     try:
         doc.save(temporary_path)
-        validate_output_pdf(
-            pymupdf,
-            temporary_path,
-            snapshot,
-            prepared,
-            moves,
-            original_heading_rect,
-            description_plan,
-        )
+        try:
+            validate_output_pdf(
+                pymupdf,
+                temporary_path,
+                snapshot,
+                prepared,
+                moves,
+                original_heading_rect,
+                description_plan,
+            )
+        except ReplacementError as exc:
+            error_pdf_base = output_path.with_name(
+                f"{output_path.stem}_error{output_path.suffix}"
+            )
+            try:
+                error_pdf_path = find_available_path(error_pdf_base)
+                temporary_path.replace(error_pdf_path)
+                exc.error_pdf_path = error_pdf_path
+            except Exception as preserve_exc:
+                preserve_detail = (
+                    "検証失敗PDFを保存できませんでした。"
+                    f"（{type(preserve_exc).__name__}: {preserve_exc}）"
+                )
+                exc.detail = (
+                    f"{exc.detail}\n{preserve_detail}"
+                    if exc.detail
+                    else preserve_detail
+                )
+            raise
         temporary_path.replace(output_path)
     except ReplacementError:
         raise
@@ -1926,8 +1947,17 @@ def write_error_file(program_dir: Path, error: ReplacementError) -> Path | None:
             (
                 f"エラー内容：{error.message}",
                 f"詳細：{error.detail or 'なし'}",
-                f"発生日時：{datetime.now().astimezone().isoformat(timespec='seconds')}",
             )
+        )
+        if error.error_pdf_path is not None:
+            lines.extend(
+                (
+                    f"検証失敗PDF：{error.error_pdf_path.name}",
+                    "注意：このPDFは保存後検証に失敗しているため、確認用です。",
+                )
+            )
+        lines.append(
+            f"発生日時：{datetime.now().astimezone().isoformat(timespec='seconds')}"
         )
         error_path.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
         return error_path
@@ -1987,6 +2017,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"エラー：{exc.message}", file=sys.stderr)
         if exc.detail:
             print(f"詳細：{exc.detail}", file=sys.stderr)
+        if exc.error_pdf_path is not None:
+            print(f"検証失敗PDF：{exc.error_pdf_path.name}", file=sys.stderr)
+            print(
+                "注意：このPDFは保存後検証に失敗しているため、確認用です。",
+                file=sys.stderr,
+            )
         error_path = write_error_file(program_dir, exc)
         if error_path is not None:
             print(f"エラー情報：{error_path.name}", file=sys.stderr)
