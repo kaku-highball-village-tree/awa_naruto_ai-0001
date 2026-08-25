@@ -31,7 +31,15 @@ OLD_CHILD_OPENING_DATE_TEXT = "令和８年８月６日開講"
 NEW_CHILD_OPENING_DATE_TEXT = "令和８年９月３日開講／令和８年10月８日開講"
 
 OLD_GENERAL_OPENING_DATE_TEXT = "令和８年９月４日開講"
-NEW_GENERAL_OPENING_DATE_TEXT = "令和８年９月４日開講／令和８年９月18日開講"
+NEW_GENERAL_OPENING_DATE_LINES = (
+    "令和８年９月４日開講／令和８年９月18日開講",
+    "令和８年10月２日開講／令和８年10月16日開講",
+)
+GENERAL_SCHEDULE_HEADING_TEXT = "受講日時"
+GENERAL_DESCRIPTION_LAST_LINE_TEXT = "つける事が大切です。"
+YOUTH_COURSE_HEADING_TEXT = "Youth Course"
+GENERAL_COURSE_HEADING_TEXT = "General Course"
+COURSE_GAP_TOLERANCE = 0.5
 
 OLD_GENERAL_SCHEDULE_TEXT = "第１・第２金曜日　１８：３０～２０：３０"
 NEW_GENERAL_SCHEDULE_LINES = (
@@ -138,11 +146,12 @@ class PreparedReplacement:
     changed_rect: Any
     deletion_rectangles: tuple[Any, ...]
     line_advance: float
+    origin_offset_y: float = 0.0
 
 
 @dataclass(frozen=True)
 class PreparedMove:
-    """一般コース欄内で必要な場合だけ下へ移動する既存行。"""
+    """一般コース欄内で必要最小限だけ移動する既存行。"""
 
     text: str
     page_index: int
@@ -151,6 +160,18 @@ class PreparedMove:
     deletion_rectangles: tuple[Any, ...]
     y_offset: float
     changed_rect: Any
+
+
+@dataclass(frozen=True)
+class GeneralDescriptionPlan:
+    """Youth Courseと同じ見出し間隔へ近づける説明文移動計画。"""
+
+    moves: tuple[PreparedMove, ...]
+    youth_gap: float
+    original_gap: float
+    upward_offset: float
+    general_heading_rect: Any
+    original_first_line_rect: Any
 
 
 @dataclass(frozen=True)
@@ -175,7 +196,7 @@ REPLACEMENTS = (
         "一般コース開講日",
         OPENING_DATE_PAGE_INDEX,
         OLD_GENERAL_OPENING_DATE_TEXT,
-        (NEW_GENERAL_OPENING_DATE_TEXT,),
+        NEW_GENERAL_OPENING_DATE_LINES,
     ),
     ReplacementSpec(
         "一般コース受講日時",
@@ -605,12 +626,170 @@ def _crosses_new_graphics(page: Any, old_rect: Any, new_rect: Any) -> bool:
     return False
 
 
+def _single_search_group(page: Any, text: str, label: str) -> SearchGroup:
+    """見出し文字列を表示位置で1件に特定する。"""
+    groups = group_overlapping_rectangles(tuple(page.search_for(text)))
+    if len(groups) != 1:
+        raise ReplacementError(
+            f"{label}を一意に特定できません。",
+            f"検索文字列：{text}／表示グループ数：{len(groups)}件",
+        )
+    return groups[0]
+
+
+def _block_lines(block: dict[str, Any], rect_class: Any) -> tuple[tuple[str, Any, tuple[dict[str, Any], ...]], ...]:
+    """テキストブロックの非空行を文字列・矩形・spanで返す。"""
+    result = []
+    for line in block.get("lines", []):
+        spans = tuple(span for span in line.get("spans", []) if str(span.get("text", "")))
+        if not spans:
+            continue
+        text = "".join(str(span.get("text", "")) for span in spans)
+        rect = rect_class(spans[0]["bbox"])
+        for span in spans[1:]:
+            rect |= rect_class(span["bbox"])
+        result.append((text, rect, spans))
+    return tuple(result)
+
+
+def prepare_general_description_spacing(pymupdf: Any, doc: Any) -> GeneralDescriptionPlan:
+    """General Course説明文をYouth Courseと同じ見出し間隔まで上へ移動する。"""
+    page = doc[OPENING_DATE_PAGE_INDEX]
+    youth_heading = _single_search_group(
+        page, YOUTH_COURSE_HEADING_TEXT, "Youth Course見出し"
+    ).union_rect
+    general_heading = _single_search_group(
+        page, GENERAL_COURSE_HEADING_TEXT, "General Course見出し"
+    ).union_rect
+    child_opening = _single_search_group(
+        page, OLD_CHILD_OPENING_DATE_TEXT, "児童コース開講日"
+    ).union_rect
+    general_opening = _single_search_group(
+        page, OLD_GENERAL_OPENING_DATE_TEXT, "一般コース開講日"
+    ).union_rect
+
+    blocks_with_lines = [
+        (block, _block_lines(block, page.rect.__class__))
+        for block in page.get_text("dict").get("blocks", [])
+    ]
+    youth_candidates = [
+        lines
+        for _, lines in blocks_with_lines
+        if lines
+        and lines[0][1].y0 >= youth_heading.y1
+        and lines[0][1].y0 < child_opening.y0
+        and YOUTH_COURSE_HEADING_TEXT not in lines[0][0]
+    ]
+    if not youth_candidates:
+        raise ReplacementError("Youth Course説明文の先頭行を確認できません。")
+    youth_lines = min(youth_candidates, key=lambda lines: lines[0][1].y0)
+
+    general_candidates = [
+        lines
+        for _, lines in blocks_with_lines
+        if lines
+        and lines[0][1].y0 >= general_heading.y1
+        and lines[-1][1].y1 < general_opening.y0
+        and any(GENERAL_DESCRIPTION_LAST_LINE_TEXT in text for text, _, _ in lines)
+    ]
+    if len(general_candidates) != 1:
+        raise ReplacementError(
+            "一般コース説明文を一意に特定できません。",
+            f"説明文候補数：{len(general_candidates)}件",
+        )
+    general_lines = general_candidates[0]
+    youth_gap = youth_lines[0][1].y0 - youth_heading.y1
+    general_gap = general_lines[0][1].y0 - general_heading.y1
+    if youth_gap <= 0 or general_gap <= 0:
+        raise ReplacementError(
+            "コース見出しと説明文の間隔が不正です。",
+            f"Youth Course：{youth_gap}／General Course：{general_gap}",
+        )
+    upward_offset = max(0.0, general_gap - youth_gap)
+    description_texts = tuple(
+        str(span.get("text", ""))
+        for _, _, spans in general_lines
+        for span in spans
+    )
+    ignored_texts = (*description_texts, *(spec.old_text for spec in REPLACEMENTS))
+    moves: list[PreparedMove] = []
+    movable_lines = general_lines if upward_offset > 0 else ()
+    for line_number, (_, _, spans) in enumerate(movable_lines, start=1):
+        for span_number, span in enumerate(spans, start=1):
+            text = str(span.get("text", ""))
+            rect = page.rect.__class__(span["bbox"])
+            origin_value = span.get("origin", (rect.x0, rect.y1))
+            style = TextStyle(
+                rect,
+                (float(origin_value[0]), float(origin_value[1])),
+                str(span.get("font", "")),
+                float(span.get("size", 0.0)),
+                int(span.get("color", 0)),
+                int(span.get("flags", 0)),
+                float(span["ascender"]) if span.get("ascender") is not None else None,
+                float(span["descender"]) if span.get("descender") is not None else None,
+            )
+            move_spec = ReplacementSpec(
+                f"一般コース説明文{line_number}行目span{span_number}",
+                OPENING_DATE_PAGE_INDEX,
+                text,
+                (text,),
+            )
+            font_path = find_japanese_font(style, move_spec)
+            y_offset = -upward_offset
+            new_rect = rect.__class__(rect.x0, rect.y0 + y_offset, rect.x1, rect.y1 + y_offset)
+            if not page.rect.contains(new_rect) or _crosses_new_graphics(page, rect, new_rect):
+                raise ReplacementError(
+                    "一般コース説明文を安全に上へ移動できません。",
+                    f"対象：{text}／移動後bbox：{tuple(new_rect)}",
+                )
+            collisions = [
+                collision
+                for other_rect, collision in _span_rectangles(page, rect, ignored_texts)
+                if new_rect.intersects(other_rect)
+            ]
+            if collisions:
+                raise ReplacementError(
+                    "一般コース説明文を安全に上へ移動できません。",
+                    f"対象：{text}／交差文字列：{' / '.join(collisions)}",
+                )
+            moves.append(
+                PreparedMove(
+                    text,
+                    OPENING_DATE_PAGE_INDEX,
+                    style,
+                    font_path,
+                    (rect,),
+                    y_offset,
+                    rect | new_rect,
+                )
+            )
+    print(f"Youth Course見出しbbox：{tuple(youth_heading)}")
+    print(f"Youth Course説明文1行目bbox：{tuple(youth_lines[0][1])}")
+    print(f"Youth Course基準間隔：{youth_gap}")
+    print(f"General Course見出しbbox：{tuple(general_heading)}")
+    print(f"一般コース説明文1行目bbox：{tuple(general_lines[0][1])}")
+    print(f"General Course現在間隔：{general_gap}")
+    print(f"一般コース説明文の上方向移動量：{upward_offset}\n")
+    return GeneralDescriptionPlan(
+        tuple(moves),
+        youth_gap,
+        general_gap,
+        upward_offset,
+        general_heading,
+        general_lines[0][1],
+    )
+
+
 def calculate_placement(
     pymupdf: Any,
     page: Any,
     style: TextStyle,
     font_path: Path,
     spec: ReplacementSpec,
+    origin_offset_y: float = 0.0,
+    line_advance_override: float | None = None,
+    additional_ignored_texts: Sequence[str] = (),
 ) -> tuple[float, Any, float]:
     """対象別の最大縮小率と安全な行間で、最大の文字サイズを選ぶ。"""
     try:
@@ -618,7 +797,12 @@ def calculate_placement(
     except Exception as exc:
         raise ReplacementError("日本語フォントを読み込めませんでした。", str(exc)) from exc
 
-    ignored_texts = GENERAL_MOVABLE_TEXTS if len(spec.new_lines) > 1 else ()
+    ignored_texts: tuple[str, ...] = ()
+    if len(spec.new_lines) > 1:
+        ignored_texts = GENERAL_MOVABLE_TEXTS
+    if spec.old_text == OLD_GENERAL_OPENING_DATE_TEXT:
+        ignored_texts += (OLD_GENERAL_SCHEDULE_TEXT,)
+    ignored_texts += tuple(additional_ignored_texts)
     other_spans = _span_rectangles(page, style.bbox, ignored_texts)
     last_failure = ""
     max_reduction_ratio = (
@@ -630,7 +814,7 @@ def calculate_placement(
     font_ascender = float(getattr(font, "ascender", style.ascender or 1.0))
     font_descender = float(getattr(font, "descender", style.descender or -0.25))
     spacing_ratios = [0.0]
-    if len(spec.new_lines) > 1:
+    if len(spec.new_lines) > 1 and line_advance_override is None:
         spacing_step_count = round(
             (MULTILINE_MAX_SPACING_RATIO - MULTILINE_MIN_SPACING_RATIO)
             / MULTILINE_SPACING_STEP
@@ -642,10 +826,17 @@ def calculate_placement(
 
     for step in range(maximum_step + 1):
         font_size = style.size * (1.0 - step / 100.0)
-        top = style.origin[1] - font_size * font_ascender
-        bottom = style.origin[1] - font_size * font_descender
+        insertion_origin_y = style.origin[1] + origin_offset_y
+        top = insertion_origin_y - font_size * font_ascender
+        bottom = insertion_origin_y - font_size * font_descender
         for spacing_ratio in spacing_ratios:
-            line_advance = font_size * spacing_ratio if len(spec.new_lines) > 1 else 0.0
+            line_advance = (
+                line_advance_override
+                if line_advance_override is not None
+                else font_size * spacing_ratio
+                if len(spec.new_lines) > 1
+                else 0.0
+            )
             line_rectangles = []
             for line_number, line_text in enumerate(spec.new_lines):
                 width = font.text_length(line_text, fontsize=font_size)
@@ -708,26 +899,36 @@ def ensure_text_only_redaction_supported(pymupdf: Any, page: Any) -> None:
         )
 
 
-def prepare_replacements(pymupdf: Any, doc: Any) -> tuple[PreparedReplacement, ...]:
+def prepare_replacements(
+    pymupdf: Any, doc: Any, description_plan: GeneralDescriptionPlan
+) -> tuple[PreparedReplacement, ...]:
     """5件すべてを編集前に検査し、部分的な変更を防ぐ。"""
-    prepared: list[PreparedReplacement] = []
+    prepared_by_old_text: dict[str, PreparedReplacement] = {}
     for spec in REPLACEMENTS:
         page = doc[spec.page_index]
         search_group = find_target_text(page, spec)
         style, deletion_rectangles = get_original_text_style(page, search_group, spec)
         ensure_text_only_redaction_supported(pymupdf, page)
         font_path = find_japanese_font(style, spec)
+        origin_offset_y = 0.0
+        line_advance_override: float | None = None
+        description_texts = tuple(move.text for move in description_plan.moves)
+        if spec.old_text == OLD_GENERAL_OPENING_DATE_TEXT:
+            origin_offset_y = -description_plan.upward_offset
         font_size, changed_rect, line_advance = calculate_placement(
-            pymupdf, page, style, font_path, spec
+            pymupdf,
+            page,
+            style,
+            font_path,
+            spec,
+            origin_offset_y,
+            line_advance_override,
+            description_texts,
         )
-        print(f"使用フォント：{font_path}")
-        print(f"変更後文字列：{spec.new_text}")
-        print(f"挿入文字サイズ：{font_size}\n")
-        if len(spec.new_lines) > 1:
-            print(f"2行のベースライン間隔：{line_advance}")
-            print(f"行間倍率：{line_advance / font_size}\n")
-        prepared.append(
-            PreparedReplacement(
+        if spec.old_text == OLD_GENERAL_SCHEDULE_TEXT:
+            opening_date = prepared_by_old_text[OLD_GENERAL_OPENING_DATE_TEXT]
+            opening_rectangles = _planned_line_rectangles(pymupdf, opening_date)
+            schedule_probe = PreparedReplacement(
                 spec,
                 style,
                 font_path,
@@ -736,8 +937,46 @@ def prepare_replacements(pymupdf: Any, doc: Any) -> tuple[PreparedReplacement, .
                 deletion_rectangles,
                 line_advance,
             )
+            schedule_rectangles = _planned_line_rectangles(pymupdf, schedule_probe)
+            minimum_gap = max(
+                MINIMUM_FOLLOWING_GAP,
+                opening_date.font_size * MULTILINE_MIN_GAP_RATIO,
+            )
+            origin_offset_y = (
+                opening_rectangles[-1].y1
+                + minimum_gap
+                - schedule_rectangles[0].y0
+            )
+            font_size, changed_rect, line_advance = calculate_placement(
+                pymupdf,
+                page,
+                style,
+                font_path,
+                spec,
+                origin_offset_y,
+                additional_ignored_texts=description_texts,
+            )
+        print(f"使用フォント：{font_path}")
+        print(f"変更後文字列：{spec.new_text}")
+        print(f"挿入文字サイズ：{font_size}\n")
+        if spec.old_text == OLD_GENERAL_OPENING_DATE_TEXT:
+            print(f"一般コース開講日のY方向移動量：{origin_offset_y}\n")
+        if spec.old_text == OLD_GENERAL_SCHEDULE_TEXT:
+            print(f"一般コース受講日時の下方向移動量：{origin_offset_y}\n")
+        if len(spec.new_lines) > 1:
+            print(f"2行のベースライン間隔：{line_advance}")
+            print(f"行間倍率：{line_advance / font_size}\n")
+        prepared_by_old_text[spec.old_text] = PreparedReplacement(
+            spec,
+            style,
+            font_path,
+            font_size,
+            changed_rect,
+            deletion_rectangles,
+            line_advance,
+            origin_offset_y,
         )
-    return tuple(prepared)
+    return tuple(prepared_by_old_text[spec.old_text] for spec in REPLACEMENTS)
 
 
 def _find_closest_group_below(page: Any, text: str, reference_rect: Any) -> SearchGroup:
@@ -757,6 +996,88 @@ def _find_closest_group_below(page: Any, text: str, reference_rect: Any) -> Sear
             "移動対象を一意に特定できませんでした。", f"検索文字列：{text}"
         )
     return candidates[0]
+
+
+def _select_general_schedule_heading(
+    heading_groups: Sequence[SearchGroup], opening_rect: Any, schedule_rect: Any
+) -> SearchGroup:
+    """2見出しから一般コースにY方向が最も近い候補を返す。"""
+    if len(heading_groups) != 2:
+        raise ReplacementError(
+            "一般コースの受講日時見出しを一意に特定できません。",
+            f"全表示グループ数：{len(heading_groups)}件（必要：2件）",
+        )
+
+    opening_center_y = (opening_rect.y0 + opening_rect.y1) / 2.0
+    schedule_center_y = (schedule_rect.y0 + schedule_rect.y1) / 2.0
+    ranked: list[tuple[float, float, SearchGroup]] = []
+    for number, group in enumerate(heading_groups, start=1):
+        rect = group.union_rect
+        if rect.get_area() <= 0:
+            raise ReplacementError(
+                "一般コースの受講日時見出しの矩形が不正です。",
+                f"候補：{number}／bbox：{tuple(rect)}",
+            )
+        center_x = (rect.x0 + rect.x1) / 2.0
+        center_y = (rect.y0 + rect.y1) / 2.0
+        opening_distance = abs(center_y - opening_center_y)
+        schedule_distance = abs(center_y - schedule_center_y)
+        print(f"受講日時見出し候補 {number}：bbox={tuple(rect)}")
+        print(
+            f"  中心X={center_x}／中心Y={center_y}／"
+            f"開講日との中心Y距離={opening_distance}／"
+            f"受講日時本文との中心Y距離={schedule_distance}"
+        )
+        ranked.append((opening_distance, schedule_distance, group))
+
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    distance_gap = ranked[1][0] - ranked[0][0]
+    if distance_gap <= 1.0:
+        raise ReplacementError(
+            "一般コースの受講日時見出しを一意に特定できません。",
+            f"開講日との中心Y距離差：{distance_gap}／必要：1.0より大きい値",
+        )
+    selected = ranked[0][2]
+    selected_center_y = (selected.union_rect.y0 + selected.union_rect.y1) / 2.0
+    if selected_center_y >= schedule_center_y:
+        raise ReplacementError(
+            "一般コースの受講日時見出しが受講日時本文より上にありません。",
+            f"見出し中心Y：{selected_center_y}／本文中心Y：{schedule_center_y}",
+        )
+    print(f"一般コース受講日時見出しの中心Y距離差：{distance_gap}")
+    return selected
+
+
+def validate_general_schedule_heading_position(
+    pymupdf: Any,
+    doc: Any,
+    replacements: Sequence[PreparedReplacement],
+) -> Any:
+    """一般コースの受講日時見出しを特定し、元位置で安全か確認する。"""
+    opening_date = next(
+        item
+        for item in replacements
+        if item.spec.old_text == OLD_GENERAL_OPENING_DATE_TEXT
+    )
+    schedule = next(
+        item for item in replacements if item.spec.old_text == OLD_GENERAL_SCHEDULE_TEXT
+    )
+    page = doc[OPENING_DATE_PAGE_INDEX]
+    heading_groups = group_overlapping_rectangles(
+        tuple(page.search_for(GENERAL_SCHEDULE_HEADING_TEXT))
+    )
+    selected = _select_general_schedule_heading(
+        heading_groups, opening_date.style.bbox, schedule.style.bbox
+    )
+    heading_rect = selected.union_rect
+    opening_rectangles = _planned_line_rectangles(pymupdf, opening_date)
+    if any(heading_rect.intersects(rect) for rect in opening_rectangles):
+        raise ReplacementError(
+            "一般コース受講日時見出しと開講日が重なります。"
+        )
+    print(f"一般コース受講日時見出しbbox：{tuple(heading_rect)}")
+    print("一般コース受講日時見出しは元位置を維持します。\n")
+    return heading_rect
 
 
 def prepare_following_line_moves(
@@ -872,7 +1193,9 @@ def insert_replacement_text(
         for line_number, line_text in enumerate(prepared.spec.new_lines):
             origin = (
                 prepared.style.origin[0],
-                prepared.style.origin[1] + line_number * prepared.line_advance,
+                prepared.style.origin[1]
+                + prepared.origin_offset_y
+                + line_number * prepared.line_advance,
             )
             results.append(
                 page.insert_text(
@@ -899,7 +1222,7 @@ def insert_replacement_text(
 def insert_moved_text(
     pymupdf: Any, page: Any, move: PreparedMove, font_number: int
 ) -> None:
-    """後続行の内容と書式を変えず、必要最小限だけ下へ再配置する。"""
+    """既存行の内容と書式を変えず、必要最小限だけ再配置する。"""
     alias = f"moved_japanese_font_{font_number}"
     try:
         page.insert_font(fontname=alias, fontfile=str(move.font_path))
@@ -913,12 +1236,12 @@ def insert_moved_text(
         )
     except Exception as exc:
         raise ReplacementError(
-            "一般コースの後続行を移動できませんでした。",
+            "一般コースの既存行を移動できませんでした。",
             f"移動対象：{move.text}／詳細：{exc}",
         ) from exc
     if result < 0:
         raise ReplacementError(
-            "一般コースの後続行を移動できませんでした。",
+            "一般コースの既存行を移動できませんでした。",
             f"移動対象：{move.text}",
         )
 
@@ -1061,16 +1384,17 @@ def _expanded_rect(rect: Any, margin_x: float, margin_y: float) -> Any:
     )
 
 
-def _line_rectangles_for_validation(pymupdf: Any, prepared: PreparedReplacement) -> tuple[Any, ...]:
-    """保存後検証用に、挿入時と同じ基準で各行の想定bboxを再計算する。"""
+def _planned_line_rectangles(pymupdf: Any, prepared: PreparedReplacement) -> tuple[Any, ...]:
+    """挿入時と同じ基準で各行の予定bboxを計算する。"""
     try:
         font = pymupdf.Font(fontfile=str(prepared.font_path))
     except Exception:
         font = None
     font_ascender = float(getattr(font, "ascender", prepared.style.ascender or 1.0))
     font_descender = float(getattr(font, "descender", prepared.style.descender or -0.25))
-    top = prepared.style.origin[1] - prepared.font_size * font_ascender
-    bottom = prepared.style.origin[1] - prepared.font_size * font_descender
+    insertion_origin_y = prepared.style.origin[1] + prepared.origin_offset_y
+    top = insertion_origin_y - prepared.font_size * font_ascender
+    bottom = insertion_origin_y - prepared.font_size * font_descender
     rectangles = []
     for line_number, line_text in enumerate(prepared.spec.new_lines):
         if font is not None:
@@ -1205,6 +1529,8 @@ def validate_output_pdf(
     snapshot: DocumentSnapshot,
     prepared: Sequence[PreparedReplacement],
     moves: Sequence[PreparedMove],
+    original_heading_rect: Any,
+    description_plan: GeneralDescriptionPlan,
 ) -> None:
     """保存PDFを開き直し、置換結果と対象外ページを検証する。"""
     try:
@@ -1226,7 +1552,7 @@ def validate_output_pdf(
         for item in prepared:
             spec = item.spec
             page = output_doc[spec.page_index]
-            expected_line_rectangles = _line_rectangles_for_validation(pymupdf, item)
+            expected_line_rectangles = _planned_line_rectangles(pymupdf, item)
             for line_number, new_line in enumerate(spec.new_lines, start=1):
                 _validate_inserted_line(
                     page,
@@ -1266,6 +1592,137 @@ def validate_output_pdf(
                     "保存後の検証に失敗しました。",
                     f"移動後の文字列「{move.text}」を確認できません。",
                 )
+            old_position_groups = [
+                group
+                for group in groups
+                if group.union_rect.intersects(move.style.bbox)
+                and overlap_ratio(group.union_rect, expected_rect) == 0
+            ]
+            if move.y_offset and old_position_groups:
+                raise ReplacementError(
+                    "保存後の検証に失敗しました。",
+                    f"移動前の文字列「{move.text}」が残っています。",
+                )
+        general_opening = next(
+            item
+            for item in prepared
+            if item.spec.old_text == OLD_GENERAL_OPENING_DATE_TEXT
+        )
+        general_schedule = next(
+            item
+            for item in prepared
+            if item.spec.old_text == OLD_GENERAL_SCHEDULE_TEXT
+        )
+        general_page = output_doc[OPENING_DATE_PAGE_INDEX]
+        opening_rectangles = _planned_line_rectangles(pymupdf, general_opening)
+        schedule_rectangles = _planned_line_rectangles(pymupdf, general_schedule)
+        heading_groups = group_overlapping_rectangles(
+            tuple(general_page.search_for(GENERAL_SCHEDULE_HEADING_TEXT))
+        )
+        try:
+            heading_group = _select_general_schedule_heading(
+                heading_groups,
+                general_opening.style.bbox,
+                general_schedule.style.bbox,
+            )
+        except ReplacementError as exc:
+            raise ReplacementError(
+                "保存後の検証に失敗しました。",
+                f"一般コース受講日時見出し：{exc.message}／{exc.detail}",
+            ) from exc
+        heading_rect = heading_group.union_rect
+        if any(
+            abs(actual - expected) > 0.5
+            for actual, expected in zip(tuple(heading_rect), tuple(original_heading_rect))
+        ):
+            raise ReplacementError(
+                "保存後の検証に失敗しました。",
+                "一般コース受講日時見出しの位置が変わっています。"
+                f"（保存前：{tuple(original_heading_rect)}／"
+                f"保存後：{tuple(heading_rect)}）",
+            )
+        if (
+            len(opening_rectangles) != 2
+            or opening_rectangles[0].y0 >= opening_rectangles[1].y0
+            or opening_rectangles[0].intersects(opening_rectangles[1])
+            or abs(
+                general_opening.origin_offset_y + description_plan.upward_offset
+            )
+            > 0.001
+        ):
+            raise ReplacementError(
+                "保存後の検証に失敗しました。",
+                "一般コース開講日の2行の順序または行間が不正です。",
+            )
+        minimum_gap = max(
+            MINIMUM_FOLLOWING_GAP,
+            general_opening.font_size * MULTILINE_MIN_GAP_RATIO,
+        )
+        if not schedule_rectangles:
+            raise ReplacementError(
+                "保存後の検証に失敗しました。",
+                "一般コース受講日時の配置を確認できません。",
+            )
+        actual_gap = schedule_rectangles[0].y0 - opening_rectangles[1].y1
+        if actual_gap < minimum_gap:
+            raise ReplacementError(
+                "保存後の検証に失敗しました。",
+                "一般コース開講日2行目と受講日時1行目の余白が不足しています。",
+            )
+        description_groups = group_overlapping_rectangles(
+            tuple(general_page.search_for(GENERAL_DESCRIPTION_LAST_LINE_TEXT))
+        )
+        description_candidates = [
+            group
+            for group in description_groups
+            if group.union_rect.y1 <= heading_rect.y0
+            and group.union_rect.x0 >= heading_rect.x0 - 1.0
+        ]
+        if len(description_candidates) != 1:
+            raise ReplacementError(
+                "保存後の検証に失敗しました。",
+                "一般コース説明文の最終行を期待位置で確認できません。",
+            )
+        description_rect = description_candidates[0].union_rect
+        if description_rect.intersects(heading_rect) or description_rect.intersects(
+            opening_rectangles[0]
+        ):
+            raise ReplacementError(
+                "保存後の検証に失敗しました。",
+                "一般コース説明文と見出しまたは開講日が重なっています。",
+            )
+
+        general_course_heading = _single_search_group(
+            general_page,
+            GENERAL_COURSE_HEADING_TEXT,
+            "General Course見出し",
+        ).union_rect
+        if any(
+            abs(actual - expected) > COURSE_GAP_TOLERANCE
+            for actual, expected in zip(
+                tuple(general_course_heading), tuple(description_plan.general_heading_rect)
+            )
+        ):
+            raise ReplacementError(
+                "保存後の検証に失敗しました。",
+                "General Course見出しの位置が変わっています。",
+            )
+        moved_first_line_rect = description_plan.original_first_line_rect.__class__(
+            description_plan.original_first_line_rect.x0,
+            description_plan.original_first_line_rect.y0
+            - description_plan.upward_offset,
+            description_plan.original_first_line_rect.x1,
+            description_plan.original_first_line_rect.y1
+            - description_plan.upward_offset,
+        )
+        saved_general_gap = moved_first_line_rect.y0 - general_course_heading.y1
+        if abs(saved_general_gap - description_plan.youth_gap) > COURSE_GAP_TOLERANCE:
+            raise ReplacementError(
+                "保存後の検証に失敗しました。",
+                "General Course見出しと説明文の間隔が"
+                f"Youth Courseと一致しません。（実際：{saved_general_gap}／"
+                f"期待：{description_plan.youth_gap}）",
+            )
 
         if not output_doc[OPENING_DATE_PAGE_INDEX].search_for(REQUIRED_WEEKLY_TEXT):
             raise ReplacementError(
@@ -1316,6 +1773,8 @@ def save_and_validate(
     snapshot: DocumentSnapshot,
     prepared: Sequence[PreparedReplacement],
     moves: Sequence[PreparedMove],
+    original_heading_rect: Any,
+    description_plan: GeneralDescriptionPlan,
 ) -> None:
     """最適化せず一時保存し、検証成功後だけ正式名へ変更する。"""
     temporary_path = output_path.with_name(
@@ -1323,7 +1782,15 @@ def save_and_validate(
     )
     try:
         doc.save(temporary_path)
-        validate_output_pdf(pymupdf, temporary_path, snapshot, prepared, moves)
+        validate_output_pdf(
+            pymupdf,
+            temporary_path,
+            snapshot,
+            prepared,
+            moves,
+            original_heading_rect,
+            description_plan,
+        )
         temporary_path.replace(output_path)
     except ReplacementError:
         raise
@@ -1393,12 +1860,27 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         print(f"入力PDF：{input_path.name}")
         doc = open_pdf(pymupdf, input_path)
-        prepared = prepare_replacements(pymupdf, doc)
-        moves = prepare_following_line_moves(pymupdf, doc, prepared)
+        description_plan = prepare_general_description_spacing(pymupdf, doc)
+        prepared = prepare_replacements(pymupdf, doc, description_plan)
+        general_schedule_heading_rect = validate_general_schedule_heading_position(
+            pymupdf, doc, prepared
+        )
+        moves = description_plan.moves + prepare_following_line_moves(
+            pymupdf, doc, prepared
+        )
         snapshot = snapshot_document(doc)
 
         apply_replacements(pymupdf, doc, prepared, moves)
-        save_and_validate(pymupdf, doc, output_path, snapshot, prepared, moves)
+        save_and_validate(
+            pymupdf,
+            doc,
+            output_path,
+            snapshot,
+            prepared,
+            moves,
+            general_schedule_heading_rect,
+            description_plan,
+        )
 
         before_images: tuple[Path, ...] = ()
         after_images: tuple[Path, ...] = ()
