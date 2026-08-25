@@ -12,10 +12,13 @@ import hashlib
 import importlib
 import importlib.util
 import inspect
+import math
 import os
+import struct
 import sys
 import unicodedata
 import uuid
+import zlib
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -83,6 +86,7 @@ class ReplacementError(Exception):
         self.message = message
         self.detail = detail
         self.error_pdf_path: Path | None = None
+        self.diagnostics: tuple[DifferenceDiagnosis, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -185,6 +189,40 @@ class DocumentSnapshot:
     page_texts: tuple[str, ...]
     untouched_render_hashes: tuple[tuple[int, str], ...]
     edited_renderings: tuple[tuple[int, int, int, int, int, bytes], ...]
+
+
+@dataclass(frozen=True)
+class AllowedChange:
+    """画像差分を許可する編集対象名と矩形。"""
+
+    label: str
+    rectangle: Any
+
+
+@dataclass(frozen=True)
+class DifferenceDiagnosis:
+    """編集許可矩形外で検出した画像差分の診断結果。"""
+
+    page_index: int
+    pixel_count: int
+    first_coordinate: tuple[int, int]
+    last_coordinate: tuple[int, int]
+    bounding_box: tuple[int, int, int, int]
+    original_rgb: tuple[int, int, int]
+    current_rgb: tuple[int, int, int]
+    maximum_rgb_difference: int
+    average_rgb_difference: float
+    nearest_label: str
+    minimum_distance: float
+    within_one_ratio: float
+    within_two_ratio: float
+    within_three_ratio: float
+    causes: tuple[str, ...]
+    confidence: str
+    reasons: tuple[str, ...]
+    before_image_path: Path
+    after_image_path: Path
+    difference_image_path: Path
 
 
 REPLACEMENTS = (
@@ -1364,12 +1402,204 @@ def snapshot_document(doc: Any) -> DocumentSnapshot:
     return DocumentSnapshot(doc.page_count, sizes, texts, hashes, tuple(renderings))
 
 
-def _validate_edited_page_outside_rectangles(
-    page: Any,
-    original: tuple[int, int, int, int, int, bytes],
-    allowed_rectangles: Sequence[Any],
+def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+    """標準ライブラリだけでRGB PNGを書くためのチャンクを返す。"""
+    payload = chunk_type + data
+    return (
+        struct.pack(">I", len(data))
+        + payload
+        + struct.pack(">I", zlib.crc32(payload) & 0xFFFFFFFF)
+    )
+
+
+def _save_rgb_png(
+    path: Path,
+    width: int,
+    height: int,
+    components: int,
+    stride: int,
+    samples: bytes | bytearray,
 ) -> None:
-    """複数の編集対象矩形の外側に視覚的な変化がないことを確認する。"""
+    """PixmapのRGB画素を外部ライブラリなしでPNGへ保存する。"""
+    if components < 3:
+        raise ReplacementError(
+            "差分確認画像を作成できませんでした。",
+            f"RGB成分数が不足しています。（検出：{components}）",
+        )
+    rows = []
+    for y in range(height):
+        row_start = y * stride
+        if components == 3:
+            row = bytes(samples[row_start : row_start + width * 3])
+        else:
+            row = bytes(
+                channel
+                for x in range(width)
+                for channel in samples[
+                    row_start + x * components : row_start + x * components + 3
+                ]
+            )
+        rows.append(b"\x00" + row)
+    png = b"\x89PNG\r\n\x1a\n"
+    png += _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+    png += _png_chunk(b"IDAT", zlib.compress(b"".join(rows), level=9))
+    png += _png_chunk(b"IEND", b"")
+    path.write_bytes(png)
+
+
+def _expanded_pixel_rectangle(rectangle: Any) -> tuple[int, int, int, int]:
+    """既存比較と同じ上下左右2ピクセル付きの許可範囲を返す。"""
+    return (
+        int(rectangle.x0) - 2,
+        int(rectangle.y0) - 2,
+        int(rectangle.x1 + 0.9999) + 2,
+        int(rectangle.y1 + 0.9999) + 2,
+    )
+
+
+def _pixel_distance_to_rectangle(
+    x: int, y: int, rectangle: tuple[int, int, int, int]
+) -> float:
+    """画素と許可矩形とのユークリッド距離を返す。"""
+    left, top, right, bottom = rectangle
+    dx = max(left - x, 0, x - (right - 1))
+    dy = max(top - y, 0, y - (bottom - 1))
+    return math.hypot(dx, dy)
+
+
+def _set_rgb_pixel(
+    samples: bytearray,
+    x: int,
+    y: int,
+    color: tuple[int, int, int],
+    width: int,
+    height: int,
+    components: int,
+    stride: int,
+) -> None:
+    """範囲内の画素へ診断用の色を設定する。"""
+    if not (0 <= x < width and 0 <= y < height):
+        return
+    offset = y * stride + x * components
+    samples[offset : offset + 3] = bytes(color)
+
+
+def _draw_pixel_rectangle(
+    samples: bytearray,
+    rectangle: tuple[int, int, int, int],
+    color: tuple[int, int, int],
+    width: int,
+    height: int,
+    components: int,
+    stride: int,
+) -> None:
+    """差分強調画像へ1ピクセル幅の矩形を描く。"""
+    left, top, right, bottom = rectangle
+    for x in range(left, right):
+        _set_rgb_pixel(samples, x, top, color, width, height, components, stride)
+        _set_rgb_pixel(samples, x, bottom - 1, color, width, height, components, stride)
+    for y in range(top, bottom):
+        _set_rgb_pixel(samples, left, y, color, width, height, components, stride)
+        _set_rgb_pixel(samples, right - 1, y, color, width, height, components, stride)
+
+
+def _diagnostic_image_path(
+    program_dir: Path, phase: str, page_number: int
+) -> Path:
+    """差分診断画像用の未使用ファイル名を返す。"""
+    return find_available_path(program_dir / f"確認用_{phase}_{page_number}ページ目.png")
+
+
+def _infer_difference_causes(
+    nearest_label: str,
+    within_one_ratio: float,
+    within_three_ratio: float,
+    average_rgb_difference: float,
+    density: float,
+) -> tuple[tuple[str, ...], str, tuple[str, ...]]:
+    """画素差の特徴から原因候補、確度、根拠を保守的に推定する。"""
+    scored: list[tuple[float, str]] = []
+    if within_one_ratio >= 0.8:
+        scored.append((0.95, "4. PDF座標と画像ピクセル座標の丸め差"))
+    elif within_three_ratio >= 0.8:
+        scored.append((0.75, "4. PDF座標と画像ピクセル座標の丸め差"))
+    if within_three_ratio >= 0.7 and average_rgb_difference <= 48:
+        scored.append((0.85, "1. 文字アンチエイリアス"))
+    if density >= 0.65:
+        scored.append((0.65, "2. redaction処理による矩形周辺の描画差"))
+    if nearest_label and within_three_ratio >= 0.6:
+        scored.append((0.6, "3. 元フォントと差し込みフォントの描画差"))
+    if within_three_ratio < 0.5:
+        scored.append((0.8, "5. 背景画像または半透明部分の再描画差"))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    causes = tuple(cause for _, cause in scored[:2])
+    if not causes:
+        return (
+            (),
+            "低",
+            ("差分の位置・形状が、定義済みの原因判定条件に十分一致しません。",),
+        )
+    top_score = scored[0][0]
+    confidence = "高" if top_score >= 0.9 else "中" if top_score >= 0.7 else "低"
+    reasons = (
+        f"差分の{within_one_ratio:.1%}が編集許可矩形から1ピクセル以内です。",
+        f"差分の{within_three_ratio:.1%}が編集許可矩形から3ピクセル以内です。",
+        f"差分の平均RGB差は{average_rgb_difference:.2f}です。",
+    )
+    return causes, confidence, reasons
+
+
+def _format_difference_diagnosis(diagnosis: DifferenceDiagnosis) -> str:
+    """コンソールとエラーファイルへ記録する日本語診断文を返す。"""
+    lines = [
+        f"差分ページ：{diagnosis.page_index + 1}ページ目",
+        f"差分画素数：{diagnosis.pixel_count}",
+        f"最初の差分座標：{diagnosis.first_coordinate}",
+        f"最後の差分座標：{diagnosis.last_coordinate}",
+        f"差分外接矩形：{diagnosis.bounding_box}",
+        f"最も近い編集対象：{diagnosis.nearest_label}",
+        f"許可矩形からの最短距離：{diagnosis.minimum_distance:.2f}ピクセル",
+        f"1ピクセル以内の差分割合：{diagnosis.within_one_ratio:.1%}",
+        f"2ピクセル以内の差分割合：{diagnosis.within_two_ratio:.1%}",
+        f"3ピクセル以内の差分割合：{diagnosis.within_three_ratio:.1%}",
+        f"変更前RGB：{diagnosis.original_rgb}",
+        f"変更後RGB：{diagnosis.current_rgb}",
+        f"RGB差の最大値：{diagnosis.maximum_rgb_difference}",
+        f"RGB差の平均値：{diagnosis.average_rgb_difference:.2f}",
+        "",
+    ]
+    if diagnosis.causes:
+        lines.append("推定原因：")
+        for index, cause in enumerate(diagnosis.causes, start=1):
+            lines.append(f"第{index}候補：{cause}")
+        lines.extend(("", f"確度：{diagnosis.confidence}", "根拠："))
+        lines.extend(f"・{reason}" for reason in diagnosis.reasons)
+    else:
+        lines.extend(
+            (
+                "推定原因：特定できません",
+                "注意：対象外要素が実際に変化している可能性があります。",
+            )
+        )
+    lines.extend(
+        (
+            "",
+            f"変更前画像：{diagnosis.before_image_path.name}",
+            f"変更後画像：{diagnosis.after_image_path.name}",
+            f"差分確認画像：{diagnosis.difference_image_path.name}",
+        )
+    )
+    return "\n".join(lines)
+
+
+def _diagnose_edited_page_outside_rectangles(
+    page: Any,
+    page_index: int,
+    original: tuple[int, int, int, int, int, bytes],
+    allowed_changes: Sequence[AllowedChange],
+    program_dir: Path,
+) -> DifferenceDiagnosis | None:
+    """許可矩形外の全差分を収集し、診断画像と原因候補を作る。"""
     _, width, height, components, stride, original_samples = original
     pixmap = page.get_pixmap(alpha=False)
     if (pixmap.width, pixmap.height, pixmap.n, pixmap.stride) != (
@@ -1382,44 +1612,133 @@ def _validate_edited_page_outside_rectangles(
             "保存後の検証に失敗しました。", "編集ページの描画サイズが変わっています。"
         )
 
-    current_samples = pixmap.samples
+    current_samples = bytes(pixmap.samples)
+    expanded_rectangles = [
+        (change, _expanded_pixel_rectangle(change.rectangle))
+        for change in allowed_changes
+    ]
+    outside_differences: list[
+        tuple[int, int, tuple[int, int, int], tuple[int, int, int], float, str]
+    ] = []
+    all_differences: list[tuple[int, int]] = []
     for y in range(height):
-        row_start = y * stride
-        row_end = row_start + stride
-        intervals = []
-        for rectangle in allowed_rectangles:
-            top = max(0, int(rectangle.y0) - 2)
-            bottom = min(height, int(rectangle.y1 + 0.9999) + 2)
-            if top <= y < bottom:
-                intervals.append(
-                    (
-                        max(0, int(rectangle.x0) - 2),
-                        min(width, int(rectangle.x1 + 0.9999) + 2),
-                    )
-                )
-        intervals.sort()
-        merged: list[tuple[int, int]] = []
-        for left, right in intervals:
-            if merged and left <= merged[-1][1]:
-                merged[-1] = (merged[-1][0], max(merged[-1][1], right))
-            else:
-                merged.append((left, right))
-        cursor = 0
-        for left, right in merged:
-            start = row_start + cursor * components
-            end = row_start + left * components
-            if original_samples[start:end] != current_samples[start:end]:
-                raise ReplacementError(
-                    "保存後の検証に失敗しました。",
-                    "指定された文字列の矩形外で見た目が変わっています。",
-                )
-            cursor = max(cursor, right)
-        tail_start = row_start + cursor * components
-        if original_samples[tail_start:row_end] != current_samples[tail_start:row_end]:
-            raise ReplacementError(
-                "保存後の検証に失敗しました。",
-                "指定された文字列の矩形外で見た目が変わっています。",
+        for x in range(width):
+            offset = y * stride + x * components
+            original_rgb = tuple(original_samples[offset : offset + 3])
+            current_rgb = tuple(current_samples[offset : offset + 3])
+            if original_rgb == current_rgb:
+                continue
+            all_differences.append((x, y))
+            containing = [
+                change
+                for change, rectangle in expanded_rectangles
+                if rectangle[0] <= x < rectangle[2]
+                and rectangle[1] <= y < rectangle[3]
+            ]
+            if containing:
+                continue
+            distances = [
+                (_pixel_distance_to_rectangle(x, y, rectangle), change.label)
+                for change, rectangle in expanded_rectangles
+            ]
+            distance, label = min(distances, default=(math.inf, "特定できません"))
+            outside_differences.append(
+                (x, y, original_rgb, current_rgb, distance, label)
             )
+    if not outside_differences:
+        return None
+
+    xs = [difference[0] for difference in outside_differences]
+    ys = [difference[1] for difference in outside_differences]
+    bounding_box = (min(xs), min(ys), max(xs) + 1, max(ys) + 1)
+    pixel_count = len(outside_differences)
+    minimum_distance, nearest_label = min(
+        (difference[4], difference[5]) for difference in outside_differences
+    )
+    within_one_ratio = sum(item[4] <= 1.0 for item in outside_differences) / pixel_count
+    within_two_ratio = sum(item[4] <= 2.0 for item in outside_differences) / pixel_count
+    within_three_ratio = sum(item[4] <= 3.0 for item in outside_differences) / pixel_count
+    channel_differences = [
+        abs(old_channel - new_channel)
+        for _, _, old_rgb, new_rgb, _, _ in outside_differences
+        for old_channel, new_channel in zip(old_rgb, new_rgb)
+    ]
+    bbox_area = max(1, (bounding_box[2] - bounding_box[0]) * (bounding_box[3] - bounding_box[1]))
+    density = pixel_count / bbox_area
+    causes, confidence, reasons = _infer_difference_causes(
+        nearest_label,
+        within_one_ratio,
+        within_three_ratio,
+        sum(channel_differences) / len(channel_differences),
+        density,
+    )
+
+    before_path = _diagnostic_image_path(program_dir, "変更前", page_index + 1)
+    after_path = _diagnostic_image_path(program_dir, "変更後", page_index + 1)
+    difference_path = _diagnostic_image_path(program_dir, "差分", page_index + 1)
+    _save_rgb_png(
+        before_path, width, height, components, stride, original_samples
+    )
+    _save_rgb_png(after_path, width, height, components, stride, current_samples)
+    highlighted = bytearray(current_samples)
+    outside_coordinates = {(item[0], item[1]) for item in outside_differences}
+    for x, y in all_differences:
+        color = (255, 0, 0) if (x, y) in outside_coordinates else (0, 96, 255)
+        _set_rgb_pixel(highlighted, x, y, color, width, height, components, stride)
+    for _, rectangle in expanded_rectangles:
+        _draw_pixel_rectangle(
+            highlighted, rectangle, (0, 200, 0), width, height, components, stride
+        )
+    _draw_pixel_rectangle(
+        highlighted, bounding_box, (255, 255, 0), width, height, components, stride
+    )
+    first_x, first_y = outside_differences[0][0], outside_differences[0][1]
+    for delta in range(-4, 5):
+        _set_rgb_pixel(
+            highlighted,
+            first_x + delta,
+            first_y,
+            (255, 255, 0),
+            width,
+            height,
+            components,
+            stride,
+        )
+        _set_rgb_pixel(
+            highlighted,
+            first_x,
+            first_y + delta,
+            (255, 255, 0),
+            width,
+            height,
+            components,
+            stride,
+        )
+    _save_rgb_png(difference_path, width, height, components, stride, highlighted)
+    first = outside_differences[0]
+    last = outside_differences[-1]
+    return DifferenceDiagnosis(
+        page_index,
+        pixel_count,
+        (first[0], first[1]),
+        (last[0], last[1]),
+        bounding_box,
+        first[2],
+        first[3],
+        max(channel_differences),
+        sum(channel_differences) / len(channel_differences),
+        nearest_label,
+        minimum_distance,
+        within_one_ratio,
+        within_two_ratio,
+        within_three_ratio,
+        causes,
+        confidence,
+        reasons,
+        before_path,
+        after_path,
+        difference_path,
+    )
 
 
 def _has_standalone_text_layer(page: Any, text: str) -> bool:
@@ -1840,17 +2159,37 @@ def validate_output_pdf(
                     f"{index + 1}ページ目の見た目が変わっています。",
                 )
         rendering_by_page = {item[0]: item for item in snapshot.edited_renderings}
-        allowed_by_page: dict[int, list[Any]] = {}
+        allowed_by_page: dict[int, list[AllowedChange]] = {}
         for item in prepared:
-            allowed_by_page.setdefault(item.spec.page_index, []).append(item.changed_rect)
-        for move in moves:
-            allowed_by_page.setdefault(move.page_index, []).append(move.changed_rect)
-        for page_index, allowed_rectangles in allowed_by_page.items():
-            _validate_edited_page_outside_rectangles(
-                output_doc[page_index],
-                rendering_by_page[page_index],
-                allowed_rectangles,
+            allowed_by_page.setdefault(item.spec.page_index, []).append(
+                AllowedChange(item.spec.label, item.changed_rect)
             )
+        for move in moves:
+            allowed_by_page.setdefault(move.page_index, []).append(
+                AllowedChange(move.text, move.changed_rect)
+            )
+        diagnostics = []
+        for page_index, allowed_changes in allowed_by_page.items():
+            diagnosis = _diagnose_edited_page_outside_rectangles(
+                output_doc[page_index],
+                page_index,
+                rendering_by_page[page_index],
+                allowed_changes,
+                output_path.parent,
+            )
+            if diagnosis is not None:
+                diagnostics.append(diagnosis)
+        if diagnostics:
+            error = ReplacementError(
+                "保存後の検証に失敗しました。",
+                "指定された文字列の矩形外で見た目が変わっています。\n\n"
+                + "\n\n".join(
+                    _format_difference_diagnosis(diagnosis)
+                    for diagnosis in diagnostics
+                ),
+            )
+            error.diagnostics = tuple(diagnostics)
+            raise error
     finally:
         output_doc.close()
 
@@ -1881,7 +2220,15 @@ def save_and_validate(
                 original_heading_rect,
                 description_plan,
             )
-        except ReplacementError as exc:
+        except Exception as validation_exc:
+            exc = (
+                validation_exc
+                if isinstance(validation_exc, ReplacementError)
+                else ReplacementError(
+                    "保存後の検証中に予期しない問題が発生しました。",
+                    f"{type(validation_exc).__name__}: {validation_exc}",
+                )
+            )
             error_pdf_base = output_path.with_name(
                 f"{output_path.stem}_error{output_path.suffix}"
             )
@@ -1899,7 +2246,9 @@ def save_and_validate(
                     if exc.detail
                     else preserve_detail
                 )
-            raise
+            if exc is validation_exc:
+                raise
+            raise exc from validation_exc
         temporary_path.replace(output_path)
     except ReplacementError:
         raise
