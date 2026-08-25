@@ -212,6 +212,8 @@ class DifferenceDiagnosis:
     current_rgb: tuple[int, int, int]
     maximum_rgb_difference: int
     average_rgb_difference: float
+    darkening_ratio: float
+    lightening_ratio: float
     nearest_label: str
     minimum_distance: float
     within_one_ratio: float
@@ -778,15 +780,21 @@ def prepare_general_description_spacing(pymupdf: Any, doc: Any) -> GeneralDescri
             font_path = find_japanese_font(style, move_spec)
             y_offset = -upward_offset
             new_rect = rect.__class__(rect.x0, rect.y0 + y_offset, rect.x1, rect.y1 + y_offset)
-            if not page.rect.contains(new_rect) or _crosses_new_graphics(page, rect, new_rect):
+            render_rect = _moved_text_render_rect(
+                pymupdf, style, font_path, text, y_offset
+            )
+            move_footprint = new_rect | render_rect
+            if not page.rect.contains(move_footprint) or _crosses_new_graphics(
+                page, rect, move_footprint
+            ):
                 raise ReplacementError(
                     "一般コース説明文を安全に上へ移動できません。",
-                    f"対象：{text}／移動後bbox：{tuple(new_rect)}",
+                    f"対象：{text}／移動後bbox：{tuple(move_footprint)}",
                 )
             collisions = [
                 collision
                 for other_rect, collision in _span_rectangles(page, rect, ignored_texts)
-                if new_rect.intersects(other_rect)
+                if move_footprint.intersects(other_rect)
             ]
             if collisions:
                 raise ReplacementError(
@@ -801,7 +809,7 @@ def prepare_general_description_spacing(pymupdf: Any, doc: Any) -> GeneralDescri
                     font_path,
                     (rect,),
                     y_offset,
-                    rect | new_rect,
+                    rect | move_footprint,
                 )
             )
     print(f"Youth Course見出しbbox：{tuple(youth_heading)}")
@@ -1205,23 +1213,27 @@ def prepare_following_line_moves(
             style.bbox.x1,
             style.bbox.y1 + y_offset,
         )
+        render_rect = _moved_text_render_rect(
+            pymupdf, style, font_path, text, y_offset
+        )
+        move_footprint = new_rect | render_rect
         print(
             f"一般コース後続行予定bbox：{text}／"
-            f"移動前={tuple(style.bbox)}／移動後={tuple(new_rect)}／"
+            f"移動前={tuple(style.bbox)}／移動後={tuple(move_footprint)}／"
             f"ページ={tuple(page.rect)}"
         )
-        if not page.rect.contains(new_rect):
-            overflow = max(0.0, new_rect.y1 - page.rect.y1)
+        if not page.rect.contains(move_footprint):
+            overflow = max(0.0, move_footprint.y1 - page.rect.y1)
             raise ReplacementError(
                 "一般コースの後続行をページ内へ移動できません。",
                 f"移動対象：{text}／Y移動量：{y_offset}／"
-                f"移動後下端：{new_rect.y1}／ページ下端：{page.rect.y1}／"
+                f"移動後下端：{move_footprint.y1}／ページ下端：{page.rect.y1}／"
                 f"超過量：{overflow}",
             )
-        if _crosses_new_graphics(page, style.bbox, new_rect):
+        if _crosses_new_graphics(page, style.bbox, move_footprint):
             raise ReplacementError(
                 "一般コースの後続行が背景線または図形へ重なるため移動できません。",
-                f"移動対象：{text}／移動後bbox：{tuple(new_rect)}",
+                f"移動対象：{text}／移動後bbox：{tuple(move_footprint)}",
             )
         for block in page.get_text("dict").get("blocks", []):
             for line in block.get("lines", []):
@@ -1234,7 +1246,7 @@ def prepare_following_line_moves(
                     ):
                         continue
                     span_rect = page.rect.__class__(span["bbox"])
-                    if new_rect.intersects(span_rect):
+                    if move_footprint.intersects(span_rect):
                         raise ReplacementError(
                             "一般コースの後続行を安全に移動できません。",
                             f"移動対象：{text}／交差文字列：{span_text}",
@@ -1247,7 +1259,7 @@ def prepare_following_line_moves(
                 font_path,
                 deletion_rectangles,
                 y_offset,
-                style.bbox | new_rect,
+                style.bbox | move_footprint,
             )
         )
 
@@ -1277,6 +1289,35 @@ def _pdf_color(pymupdf: Any, color: int) -> tuple[float, float, float]:
     """PyMuPDFの整数色を0～1のRGBへ変換する。"""
     red, green, blue = pymupdf.sRGB_to_rgb(color)
     return red / 255.0, green / 255.0, blue / 255.0
+
+
+def _moved_text_render_rect(
+    pymupdf: Any,
+    style: TextStyle,
+    font_path: Path,
+    text: str,
+    y_offset: float,
+) -> Any:
+    """実際の挿入フォントと原点から移動後文字の描画予定矩形を返す。"""
+    try:
+        font = pymupdf.Font(fontfile=str(font_path))
+        width = float(font.text_length(text, fontsize=style.size))
+        ascender = float(getattr(font, "ascender", style.ascender or 1.0))
+        descender = float(getattr(font, "descender", style.descender or -0.25))
+    except Exception as exc:
+        raise ReplacementError(
+            "移動後文字列の描画範囲を計算できませんでした。",
+            f"対象：{text}／詳細：{exc}",
+        ) from exc
+    baseline_y = style.origin[1] + y_offset
+    top = baseline_y - style.size * ascender
+    bottom = baseline_y - style.size * descender
+    return style.bbox.__class__(
+        style.origin[0],
+        min(top, bottom),
+        style.origin[0] + width,
+        max(top, bottom),
+    )
 
 
 def insert_replacement_text(
@@ -1513,22 +1554,32 @@ def _diagnostic_image_path(
 def _infer_difference_causes(
     nearest_label: str,
     within_one_ratio: float,
+    within_two_ratio: float,
     within_three_ratio: float,
     average_rgb_difference: float,
     density: float,
+    darkening_ratio: float,
+    lightening_ratio: float,
 ) -> tuple[tuple[str, ...], str, tuple[str, ...]]:
     """画素差の特徴から原因候補、確度、根拠を保守的に推定する。"""
     scored: list[tuple[float, str]] = []
     if within_one_ratio >= 0.8:
         scored.append((0.95, "4. PDF座標と画像ピクセル座標の丸め差"))
+    elif within_two_ratio >= 0.95:
+        scored.append((0.9, "4. PDF座標と画像ピクセル座標の丸め差"))
     elif within_three_ratio >= 0.8:
         scored.append((0.75, "4. PDF座標と画像ピクセル座標の丸め差"))
     if within_three_ratio >= 0.7 and average_rgb_difference <= 48:
         scored.append((0.85, "1. 文字アンチエイリアス"))
-    if density >= 0.65:
+    if density >= 0.65 and lightening_ratio >= 0.6:
         scored.append((0.65, "2. redaction処理による矩形周辺の描画差"))
-    if nearest_label and within_three_ratio >= 0.6:
-        scored.append((0.6, "3. 元フォントと差し込みフォントの描画差"))
+    if (
+        nearest_label
+        and nearest_label != "特定できません"
+        and within_three_ratio >= 0.6
+        and darkening_ratio >= 0.6
+    ):
+        scored.append((0.85, "3. 元フォントと差し込みフォントの描画差"))
     if within_three_ratio < 0.5:
         scored.append((0.8, "5. 背景画像または半透明部分の再描画差"))
     scored.sort(key=lambda item: item[0], reverse=True)
@@ -1543,8 +1594,11 @@ def _infer_difference_causes(
     confidence = "高" if top_score >= 0.9 else "中" if top_score >= 0.7 else "低"
     reasons = (
         f"差分の{within_one_ratio:.1%}が編集許可矩形から1ピクセル以内です。",
+        f"差分の{within_two_ratio:.1%}が編集許可矩形から2ピクセル以内です。",
         f"差分の{within_three_ratio:.1%}が編集許可矩形から3ピクセル以内です。",
         f"差分の平均RGB差は{average_rgb_difference:.2f}です。",
+        f"暗くなった差分の割合は{darkening_ratio:.1%}です。",
+        f"明るくなった差分の割合は{lightening_ratio:.1%}です。",
     )
     return causes, confidence, reasons
 
@@ -1566,6 +1620,8 @@ def _format_difference_diagnosis(diagnosis: DifferenceDiagnosis) -> str:
         f"変更後RGB：{diagnosis.current_rgb}",
         f"RGB差の最大値：{diagnosis.maximum_rgb_difference}",
         f"RGB差の平均値：{diagnosis.average_rgb_difference:.2f}",
+        f"暗くなった差分の割合：{diagnosis.darkening_ratio:.1%}",
+        f"明るくなった差分の割合：{diagnosis.lightening_ratio:.1%}",
         "",
     ]
     if diagnosis.causes:
@@ -1663,14 +1719,23 @@ def _diagnose_edited_page_outside_rectangles(
         for _, _, old_rgb, new_rgb, _, _ in outside_differences
         for old_channel, new_channel in zip(old_rgb, new_rgb)
     ]
+    luminance_changes = [
+        sum(new_rgb) - sum(old_rgb)
+        for _, _, old_rgb, new_rgb, _, _ in outside_differences
+    ]
+    darkening_ratio = sum(change < 0 for change in luminance_changes) / pixel_count
+    lightening_ratio = sum(change > 0 for change in luminance_changes) / pixel_count
     bbox_area = max(1, (bounding_box[2] - bounding_box[0]) * (bounding_box[3] - bounding_box[1]))
     density = pixel_count / bbox_area
     causes, confidence, reasons = _infer_difference_causes(
         nearest_label,
         within_one_ratio,
+        within_two_ratio,
         within_three_ratio,
         sum(channel_differences) / len(channel_differences),
         density,
+        darkening_ratio,
+        lightening_ratio,
     )
 
     before_path = _diagnostic_image_path(program_dir, "変更前", page_index + 1)
@@ -1727,6 +1792,8 @@ def _diagnose_edited_page_outside_rectangles(
         first[3],
         max(channel_differences),
         sum(channel_differences) / len(channel_differences),
+        darkening_ratio,
+        lightening_ratio,
         nearest_label,
         minimum_distance,
         within_one_ratio,
