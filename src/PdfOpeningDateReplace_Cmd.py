@@ -363,6 +363,27 @@ INFORMATION_MOVES = (
     ),
 )
 
+INFORMATION_MOVES = (
+    ReplacementSpec(
+        "募集期間見出し",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        RECRUITMENT_HEADING_TEXT,
+        (RECRUITMENT_HEADING_TEXT,),
+    ),
+    ReplacementSpec(
+        "受付開始日",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        NEW_RECEPTION_START_TEXT,
+        (NEW_RECEPTION_START_TEXT,),
+    ),
+    ReplacementSpec(
+        "募集期間注記",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        RECRUITMENT_NOTE_TEXT,
+        (RECRUITMENT_NOTE_TEXT,),
+    ),
+)
+
 
 def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """コマンドライン引数を解析する。"""
@@ -1698,6 +1719,11 @@ def prepare_information_moves(
     pymupdf: Any, doc: Any
 ) -> tuple[PreparedInformationMove, ...]:
     """置換後の募集期間3行を取得し、5ページ目上部への配置を検査する。"""
+    if not _has_replaced_reception_text(doc):
+        raise ReplacementError(
+            "受付開始日の置換完了前にはページ間移動を準備できません。",
+            "先に通常置換と4ページ目の再読み込みを完了してください。",
+        )
     source_page = doc[INFORMATION_SOURCE_PAGE_INDEX]
     destination_page = doc[INFORMATION_DESTINATION_PAGE_INDEX]
     ensure_text_only_redaction_supported(pymupdf, source_page)
