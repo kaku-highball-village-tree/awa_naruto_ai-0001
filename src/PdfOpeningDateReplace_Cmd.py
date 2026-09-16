@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""指定された2箇所の日付だけを安全に差し替えるコマンド。
+"""指定文字列の差し替えと4ページ目から5ページ目への移動を安全に行うコマンド。
 
 PyMuPDF が未導入の場合:
     py -m pip install pymupdf
@@ -63,6 +63,16 @@ NEW_RECEPTION_START_TEXT = "令和８年８月１日より受付開始"
 COMPUTER_NOTE_PAGE_INDEX = 3
 OLD_COMPUTER_NOTE_TEXT = "※どちらか一方でも可"
 NEW_COMPUTER_NOTE_TEXT = "※どちらか一方でも可(パソコン推奨)"
+
+INFORMATION_SOURCE_PAGE_INDEX = 3
+INFORMATION_DESTINATION_PAGE_INDEX = 4
+INFORMATION_DESTINATION_VERTICAL_GAP = 30.0
+RECRUITMENT_HEADING_TEXT = "募集期間"
+RECRUITMENT_NOTE_TEXT = "(各コース開講前まで応募可能)"
+REQUIRED_ITEMS_HEADING_TEXT = "受講必需品"
+REQUIRED_ITEMS_TEXT = "パソコンとスマートフォン"
+VENUE_HEADING_TEXT = "開催場所"
+VENUE_TEXT = "コミュニティーはうすTSUDOI"
 
 REQUIRED_WEEKLY_TEXT = "毎週木曜日"
 REQUIRED_RECEPTION_TEXTS = ("募集期間", "(各コース開講前まで応募可能)")
@@ -169,6 +179,18 @@ class PreparedMove:
 
 
 @dataclass(frozen=True)
+class PreparedInformationMove:
+    """4ページ目から5ページ目へ移す1行分の文字情報。"""
+
+    spec: ReplacementSpec
+    style: TextStyle
+    font_path: Path
+    deletion_rectangles: tuple[Any, ...]
+    destination_origin: tuple[float, float]
+    destination_rect: Any
+
+
+@dataclass(frozen=True)
 class GeneralDescriptionPlan:
     """Youth Courseと同じ見出し間隔へ近づける説明文移動計画。"""
 
@@ -260,6 +282,27 @@ REPLACEMENTS = (
     ),
 )
 
+INFORMATION_MOVES = (
+    ReplacementSpec(
+        "募集期間見出し",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        RECRUITMENT_HEADING_TEXT,
+        (RECRUITMENT_HEADING_TEXT,),
+    ),
+    ReplacementSpec(
+        "受付開始日",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        NEW_RECEPTION_START_TEXT,
+        (NEW_RECEPTION_START_TEXT,),
+    ),
+    ReplacementSpec(
+        "募集期間注記",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        RECRUITMENT_NOTE_TEXT,
+        (RECRUITMENT_NOTE_TEXT,),
+    ),
+)
+
 
 def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """コマンドライン引数を解析する。"""
@@ -267,7 +310,7 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--render-comparison",
         action="store_true",
-        help="3・4ページ目の変更前後を確認用PNGとして出力します。",
+        help="3～5ページ目の変更前後を確認用PNGとして出力します。",
     )
     return parser.parse_args(argv)
 
@@ -369,6 +412,120 @@ def group_overlapping_rectangles(rectangles: Sequence[Any]) -> tuple[SearchGroup
     return tuple(groups)
 
 
+def _character_for_search_group(page: Any, group: SearchGroup) -> str:
+    """1つの表示グループと重なる内部文字が一意なら、その文字を返す。"""
+    characters = set()
+    for block in page.get_text("rawdict").get("blocks", []):
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                for character in span.get("chars", []):
+                    character_text = normalize_whitespace_for_comparison(
+                        str(character.get("c", ""))
+                    )
+                    if not character_text:
+                        continue
+                    character_rect = page.rect.__class__(character["bbox"])
+                    if overlap_ratio(character_rect, group.union_rect) >= 0.5:
+                        characters.add(character_text)
+    return next(iter(characters)) if len(characters) == 1 else ""
+
+
+def _fragmented_groups_form_one_line(groups: Sequence[SearchGroup]) -> bool:
+    """文字グループが同じ行を左から右へ妥当な間隔で並ぶか確認する。"""
+    if not groups:
+        return False
+    maximum_height = max(group.union_rect.height for group in groups)
+    center_y_values = tuple(
+        (group.union_rect.y0 + group.union_rect.y1) / 2.0 for group in groups
+    )
+    center_y_difference = max(center_y_values) - min(center_y_values)
+    center_y_tolerance = maximum_height * 0.35
+    print(f"分割グループの中心Y最大差：{center_y_difference}")
+    print(f"分割グループの中心Y許容差：{center_y_tolerance}")
+    if center_y_difference > center_y_tolerance:
+        return False
+
+    for number, (previous, current) in enumerate(
+        zip(groups, groups[1:]), start=1
+    ):
+        if current.union_rect.x0 <= previous.union_rect.x0:
+            return False
+        gap = current.union_rect.x0 - previous.union_rect.x1
+        size_reference = max(
+            previous.union_rect.width,
+            current.union_rect.width,
+            previous.union_rect.height,
+            current.union_rect.height,
+        )
+        minimum_gap = -size_reference * 0.25
+        maximum_gap = size_reference * 1.5
+        print(
+            f"分割グループ間隔 {number}：{gap}／"
+            f"許容範囲={minimum_gap}～{maximum_gap}"
+        )
+        if gap < minimum_gap or gap > maximum_gap:
+            return False
+    return True
+
+
+def _find_fragmented_text_groups(
+    page: Any, text: str, initial_groups: Sequence[SearchGroup]
+) -> tuple[SearchGroup, ...]:
+    """文字単位の検索グループを座標と内部文字から安全に再構成する。"""
+    target_characters = tuple(normalize_whitespace_for_comparison(text))
+    if len(target_characters) < 2:
+        return ()
+
+    detected = tuple(
+        (group, _character_for_search_group(page, group)) for group in initial_groups
+    )
+    ordered = tuple(sorted(detected, key=lambda item: item[0].union_rect.x0))
+    for number, (group, character) in enumerate(ordered, start=1):
+        print(
+            f"分割グループ {number}：{character or '判定不能'}／"
+            f"bbox={tuple(group.union_rect)}／重複矩形数={len(group.rectangles)}件"
+        )
+
+    candidate_sequences: list[tuple[tuple[SearchGroup, str], ...]] = []
+
+    def collect_sequences(
+        character_index: int,
+        minimum_x: float,
+        selected: tuple[tuple[SearchGroup, str], ...],
+    ) -> None:
+        if character_index == len(target_characters):
+            candidate_sequences.append(selected)
+            return
+        expected_character = target_characters[character_index]
+        for item in ordered:
+            group, character = item
+            if character != expected_character or group.union_rect.x0 <= minimum_x:
+                continue
+            collect_sequences(
+                character_index + 1,
+                group.union_rect.x0,
+                (*selected, item),
+            )
+
+    collect_sequences(0, float("-inf"), ())
+    candidates = []
+    for sequence in candidate_sequences:
+        groups = tuple(item[0] for item in sequence)
+        candidate_text = "".join(item[1] for item in sequence)
+        if not _fragmented_groups_form_one_line(groups):
+            continue
+        rectangles = tuple(
+            rectangle for group in groups for rectangle in group.rectangles
+        )
+        union_rect = rectangles[0].__class__(rectangles[0])
+        for rectangle in rectangles[1:]:
+            union_rect |= rectangle
+        candidates.append(SearchGroup(rectangles, union_rect))
+        print(f"再構成候補文字列：{candidate_text}")
+
+    return tuple(candidates)
+
+
 def find_target_text(page: Any, spec: ReplacementSpec) -> SearchGroup:
     """旧文字列を検索し、表示位置が厳密に1グループの場合だけ返す。"""
     rectangles = tuple(page.search_for(spec.old_text))
@@ -391,9 +548,25 @@ def find_target_text(page: Any, spec: ReplacementSpec) -> SearchGroup:
     groups = group_overlapping_rectangles(rectangles)
     print(f"表示グループ数：{len(groups)}件")
     if len(groups) != 1:
+        print("検索結果が文字単位に分割されている可能性があります。")
+        print("分割表示グループを文字列として再構成します。")
+        fragmented_groups = _find_fragmented_text_groups(page, spec.old_text, groups)
+        print(f"再構成後表示グループ数：{len(fragmented_groups)}件")
+        if len(fragmented_groups) == 1:
+            print(
+                "字間によって分割された検索結果を、PDF内部の文字情報から"
+                "1つの表示位置として復元しました。"
+            )
+            print(
+                "復元した表示グループの和集合："
+                f"{tuple(fragmented_groups[0].union_rect)}"
+            )
+            return fragmented_groups[0]
         raise ReplacementError(
             "変更対象が異なる表示位置に複数見つかったため、処理を中止しました。",
-            f"対象ページ：{spec.page_index + 1}ページ目／表示グループ数：{len(groups)}件",
+            f"対象ページ：{spec.page_index + 1}ページ目／"
+            f"表示グループ数：{len(groups)}件／"
+            f"再構成後：{len(fragmented_groups)}件",
         )
     print(f"表示グループの和集合：{tuple(groups[0].union_rect)}")
     return groups[0]
@@ -477,7 +650,113 @@ def _matching_text_layers(
                     representative_span.get("descender"),
                 )
             )
-    return tuple(layers)
+    if layers:
+        return tuple(layers)
+    return _matching_fragmented_text_layer(page, spec, search_group)
+
+
+def _matching_fragmented_text_layer(
+    page: Any, spec: ReplacementSpec, search_group: SearchGroup
+) -> tuple[TextLayer, ...]:
+    """rawdictで別行になった分割文字から代表書式を復元する。"""
+    character_groups = tuple(
+        sorted(
+            group_overlapping_rectangles(search_group.rectangles),
+            key=lambda group: group.union_rect.x0,
+        )
+    )
+    reconstructed_text = "".join(
+        _character_for_search_group(page, group) for group in character_groups
+    )
+    if normalize_whitespace_for_comparison(reconstructed_text) != (
+        normalize_whitespace_for_comparison(spec.old_text)
+    ):
+        return ()
+
+    candidates = []
+    for block in page.get_text("rawdict").get("blocks", []):
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                for character in span.get("chars", []):
+                    character_text = normalize_whitespace_for_comparison(
+                        str(character.get("c", ""))
+                    )
+                    if not character_text:
+                        continue
+                    character_rect = page.rect.__class__(character["bbox"])
+                    if any(
+                        overlap_ratio(character_rect, group.union_rect) >= 0.5
+                        for group in character_groups
+                    ):
+                        candidates.append((character, span))
+    if not candidates:
+        return ()
+
+    signature_counts: dict[tuple[str, float, int, int], int] = {}
+    for _, span in candidates:
+        signature = (
+            str(span.get("font", "")),
+            float(span.get("size", 0.0)),
+            int(span.get("color", 0)),
+            int(span.get("flags", 0)),
+        )
+        signature_counts[signature] = signature_counts.get(signature, 0) + 1
+    representative_signature = max(
+        signature_counts,
+        key=lambda signature: (
+            signature_counts[signature],
+            "t3" not in signature[0].lower()
+            and "type3" not in signature[0].lower(),
+        ),
+    )
+    representative_character, representative_span = next(
+        (character, span)
+        for character, span in candidates
+        if (
+            str(span.get("font", "")),
+            float(span.get("size", 0.0)),
+            int(span.get("color", 0)),
+            int(span.get("flags", 0)),
+        )
+        == representative_signature
+    )
+    first_group = character_groups[0]
+    first_candidates = [
+        (character, span)
+        for character, span in candidates
+        if overlap_ratio(
+            page.rect.__class__(character["bbox"]), first_group.union_rect
+        )
+        >= 0.5
+        and (
+            str(span.get("font", "")),
+            float(span.get("size", 0.0)),
+            int(span.get("color", 0)),
+            int(span.get("flags", 0)),
+        )
+        == representative_signature
+    ]
+    if first_candidates:
+        representative_character, representative_span = first_candidates[0]
+    origin_value = representative_character.get(
+        "origin",
+        representative_span.get(
+            "origin", (search_group.union_rect.x0, search_group.union_rect.y1)
+        ),
+    )
+    return (
+        TextLayer(
+            spec.old_text,
+            search_group.union_rect,
+            representative_signature[0],
+            representative_signature[1],
+            representative_signature[2],
+            representative_signature[3],
+            (float(origin_value[0]), float(origin_value[1])),
+            representative_span.get("ascender"),
+            representative_span.get("descender"),
+        ),
+    )
 
 
 def _choose_representative_layer(layers: Sequence[TextLayer]) -> TextLayer:
@@ -506,6 +785,20 @@ def _ensure_deletion_rectangles_are_safe(
 ) -> None:
     """交差span群の空白除去後文字列と座標が対象に一致することを確認する。"""
     normalized_old_text = normalize_whitespace_for_comparison(spec.old_text)
+    character_groups = group_overlapping_rectangles(search_group.rectangles)
+    if len(character_groups) > 1:
+        ordered_groups = tuple(
+            sorted(character_groups, key=lambda group: group.union_rect.x0)
+        )
+        reconstructed_text = "".join(
+            _character_for_search_group(page, group) for group in ordered_groups
+        )
+        if normalize_whitespace_for_comparison(reconstructed_text) != normalized_old_text:
+            raise ReplacementError(
+                "変更対象以外の文字を削除する可能性があるため、処理を中止しました。",
+                f"処理対象：{spec.label}／再構成文字列：{reconstructed_text}",
+            )
+        return
     for block in page.get_text("dict").get("blocks", []):
         for line in block.get("lines", []):
             intersecting_spans = []
@@ -596,7 +889,13 @@ def get_original_text_style(
         ascender=representative.ascender,
         descender=representative.descender,
     )
-    return style, tuple(layer.rect for layer in layers)
+    fragmented_groups = group_overlapping_rectangles(search_group.rectangles)
+    deletion_rectangles = (
+        tuple(search_group.rectangles)
+        if len(fragmented_groups) > 1
+        else tuple(layer.rect for layer in layers)
+    )
+    return style, deletion_rectangles
 
 
 def _font_candidates(is_bold: bool) -> tuple[str, ...]:
@@ -951,7 +1250,7 @@ def ensure_text_only_redaction_supported(pymupdf: Any, page: Any) -> None:
 def prepare_replacements(
     pymupdf: Any, doc: Any, description_plan: GeneralDescriptionPlan
 ) -> tuple[PreparedReplacement, ...]:
-    """5件すべてを編集前に検査し、部分的な変更を防ぐ。"""
+    """通常置換の全対象を編集前に検査し、部分的な変更を防ぐ。"""
     prepared_by_old_text: dict[str, PreparedReplacement] = {}
     for spec in REPLACEMENTS:
         page = doc[spec.page_index]
@@ -1270,6 +1569,132 @@ def prepare_following_line_moves(
     return tuple(moves)
 
 
+def _destination_text_rectangles(page: Any) -> tuple[tuple[Any, str], ...]:
+    """移動先ページに既存する空でない文字spanと矩形を返す。"""
+    rectangles = []
+    for block in page.get_text("dict").get("blocks", []):
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                text = str(span.get("text", ""))
+                if text.strip():
+                    rectangles.append((page.rect.__class__(span["bbox"]), text))
+    return tuple(rectangles)
+
+
+def _information_destination_rect(
+    pymupdf: Any,
+    style: TextStyle,
+    font_path: Path,
+    text: str,
+    origin: tuple[float, float],
+) -> Any:
+    """指定した基準点と元書式で5ページ目へ挿入する文字のbboxを返す。"""
+    try:
+        font = pymupdf.Font(fontfile=str(font_path))
+        width = float(font.text_length(text, fontsize=style.size))
+        ascender = float(getattr(font, "ascender", style.ascender or 1.0))
+        descender = float(getattr(font, "descender", style.descender or -0.25))
+    except Exception as exc:
+        raise ReplacementError(
+            "移動後文字列の描画範囲を計算できませんでした。",
+            f"対象：{text}／詳細：{exc}",
+        ) from exc
+    top = origin[1] - style.size * ascender
+    bottom = origin[1] - style.size * descender
+    return pymupdf.Rect(
+        origin[0],
+        min(top, bottom),
+        origin[0] + width,
+        max(top, bottom),
+    )
+
+
+def _information_destination_origin(
+    pymupdf: Any,
+    style: TextStyle,
+    font_path: Path,
+    previous_rect: Any | None,
+) -> tuple[float, float]:
+    """5ページ目上部で前の行と重ならない挿入基準点を返す。"""
+    if previous_rect is None:
+        return style.origin
+    try:
+        font = pymupdf.Font(fontfile=str(font_path))
+        ascender = float(getattr(font, "ascender", style.ascender or 1.0))
+    except Exception as exc:
+        raise ReplacementError(
+            "移動後文字列の基準点を計算できませんでした。",
+            f"詳細：{exc}",
+        ) from exc
+    return (
+        style.origin[0],
+        previous_rect.y1
+        + INFORMATION_DESTINATION_VERTICAL_GAP
+        + style.size * ascender,
+    )
+
+
+def prepare_information_moves(
+    pymupdf: Any, doc: Any
+) -> tuple[PreparedInformationMove, ...]:
+    """置換後の募集期間3行を取得し、5ページ目上部への配置を検査する。"""
+    source_page = doc[INFORMATION_SOURCE_PAGE_INDEX]
+    destination_page = doc[INFORMATION_DESTINATION_PAGE_INDEX]
+    ensure_text_only_redaction_supported(pymupdf, source_page)
+    existing_destination_texts = _destination_text_rectangles(destination_page)
+    prepared = []
+    previous_destination_rect = None
+
+    for spec in INFORMATION_MOVES:
+        search_group = find_target_text(source_page, spec)
+        style, deletion_rectangles = get_original_text_style(
+            source_page, search_group, spec
+        )
+        font_path = find_japanese_font(style, spec)
+        new_text = spec.new_lines[0]
+        destination_origin = _information_destination_origin(
+            pymupdf, style, font_path, previous_destination_rect
+        )
+        destination_rect = _information_destination_rect(
+            pymupdf, style, font_path, new_text, destination_origin
+        )
+        if not destination_page.rect.contains(destination_rect):
+            raise ReplacementError(
+                "移動後文字列が5ページ目の領域からはみ出します。",
+                f"処理対象：{spec.label}／予定矩形：{tuple(destination_rect)}",
+            )
+        colliding_texts = tuple(
+            text
+            for rect, text in existing_destination_texts
+            if rect.intersects(destination_rect)
+        )
+        if colliding_texts:
+            raise ReplacementError(
+                "移動後文字列が5ページ目の既存文字と重なります。",
+                f"処理対象：{spec.label}／交差文字列：{' / '.join(colliding_texts)}",
+            )
+        prepared.append(
+            PreparedInformationMove(
+                spec,
+                style,
+                font_path,
+                deletion_rectangles,
+                destination_origin,
+                destination_rect,
+            )
+        )
+        previous_destination_rect = destination_rect
+
+    for index, item in enumerate(prepared):
+        for other in prepared[index + 1 :]:
+            if item.destination_rect.intersects(other.destination_rect):
+                raise ReplacementError(
+                    "5ページ目へ移す文字列同士が重なります。",
+                    f"処理対象：{item.spec.label}／{other.spec.label}",
+                )
+    return tuple(prepared)
+
+
 def remove_original_text(
     pymupdf: Any, page: Any, target_rectangles: Sequence[Any]
 ) -> None:
@@ -1384,6 +1809,48 @@ def insert_moved_text(
         )
 
 
+def insert_information_text(
+    pymupdf: Any, page: Any, item: PreparedInformationMove, font_number: int
+) -> None:
+    """4ページ目から取得した書式で変更後文字列を5ページ目へ挿入する。"""
+    alias = f"information_japanese_font_{font_number}"
+    try:
+        page.insert_font(fontname=alias, fontfile=str(item.font_path))
+        result = page.insert_text(
+            item.destination_origin,
+            item.spec.new_lines[0],
+            fontsize=item.style.size,
+            fontname=alias,
+            color=_pdf_color(pymupdf, item.style.color),
+            overlay=True,
+        )
+    except Exception as exc:
+        raise ReplacementError(
+            "5ページ目へ文字列を書き込めませんでした。",
+            f"処理対象：{item.spec.label}／詳細：{exc}",
+        ) from exc
+    if result < 0:
+        raise ReplacementError(
+            "5ページ目へ文字列を書き込めませんでした。",
+            f"処理対象：{item.spec.label}",
+        )
+
+
+def apply_information_moves(
+    pymupdf: Any, doc: Any, prepared: Sequence[PreparedInformationMove]
+) -> None:
+    """4ページ目の対象文字だけを削除し、5ページ目へまとめて挿入する。"""
+    deletion_rectangles = tuple(
+        rectangle for item in prepared for rectangle in item.deletion_rectangles
+    )
+    remove_original_text(
+        pymupdf, doc[INFORMATION_SOURCE_PAGE_INDEX], deletion_rectangles
+    )
+    destination_page = doc[INFORMATION_DESTINATION_PAGE_INDEX]
+    for font_number, item in enumerate(prepared, start=1):
+        insert_information_text(pymupdf, destination_page, item, font_number)
+
+
 def apply_replacements(
     pymupdf: Any,
     doc: Any,
@@ -1410,6 +1877,54 @@ def apply_replacements(
         insert_moved_text(pymupdf, page, move, font_number)
 
 
+def _has_replaced_reception_text(doc: Any) -> bool:
+    """4ページ目で旧受付開始日が消え、置換後文字列が検索できるか返す。"""
+    page = doc[INFORMATION_SOURCE_PAGE_INDEX]
+    return not page.search_for(OLD_RECEPTION_START_TEXT) and bool(
+        page.search_for(NEW_RECEPTION_START_TEXT)
+    )
+
+
+def refresh_after_replacements(pymupdf: Any, doc: Any) -> Any:
+    """置換後文字列を再検索できる文書へ更新し、必要ならメモリ上で開き直す。"""
+    try:
+        page = doc[INFORMATION_SOURCE_PAGE_INDEX]
+        doc.reload_page(page)
+        print("文字列置換後の4ページ目を再読み込みしました。")
+    except Exception as exc:
+        print(f"4ページ目を直接再読み込みできませんでした：{exc}")
+
+    if _has_replaced_reception_text(doc):
+        print(f"置換後文字列を確認しました：{NEW_RECEPTION_START_TEXT}\n")
+        return doc
+
+    print("置換後文字列を再認識するため、PDFをメモリ上で開き直します。")
+    try:
+        refreshed_doc = pymupdf.open(stream=doc.tobytes(), filetype="pdf")
+    except Exception as exc:
+        raise ReplacementError(
+            "文字列置換後のPDFを開き直せませんでした。", str(exc)
+        ) from exc
+    if refreshed_doc.needs_pass or refreshed_doc.is_encrypted:
+        refreshed_doc.close()
+        raise ReplacementError("文字列置換後のPDFが暗号化されています。")
+    if refreshed_doc.page_count != doc.page_count:
+        refreshed_doc.close()
+        raise ReplacementError(
+            "文字列置換後のPDFを開き直したところページ数が変わりました。"
+        )
+    if not _has_replaced_reception_text(refreshed_doc):
+        refreshed_doc.close()
+        raise ReplacementError(
+            "置換後の受付開始日を再検索できませんでした。",
+            f"対象ページ：4ページ目／検索文字列：{NEW_RECEPTION_START_TEXT}",
+        )
+
+    doc.close()
+    print(f"置換後文字列を確認しました：{NEW_RECEPTION_START_TEXT}\n")
+    return refreshed_doc
+
+
 def _render_hash(page: Any) -> str:
     """対象外ページの見た目を比較する等倍RGB画像ハッシュを返す。"""
     pixmap = page.get_pixmap(alpha=False)
@@ -1417,9 +1932,18 @@ def _render_hash(page: Any) -> str:
     return hashlib.sha256(header + pixmap.samples).hexdigest()
 
 
+def edited_page_indexes() -> set[int]:
+    """通常置換とページ間移動で変更する全ページのindexを返す。"""
+    return {
+        *(spec.page_index for spec in REPLACEMENTS),
+        INFORMATION_SOURCE_PAGE_INDEX,
+        INFORMATION_DESTINATION_PAGE_INDEX,
+    }
+
+
 def snapshot_document(doc: Any) -> DocumentSnapshot:
     """変更前のページ構成、テキスト、対象外ページの見た目を記録する。"""
-    edited_pages = {spec.page_index for spec in REPLACEMENTS}
+    edited_pages = edited_page_indexes()
     sizes = tuple((float(page.rect.width), float(page.rect.height)) for page in doc)
     texts = tuple(page.get_text() for page in doc)
     hashes = tuple(
@@ -1974,6 +2498,7 @@ def validate_output_pdf(
     snapshot: DocumentSnapshot,
     prepared: Sequence[PreparedReplacement],
     moves: Sequence[PreparedMove],
+    information_moves: Sequence[PreparedInformationMove],
     original_heading_rect: Any,
     description_plan: GeneralDescriptionPlan,
 ) -> None:
@@ -1994,8 +2519,16 @@ def validate_output_pdf(
         if output_sizes != snapshot.page_sizes:
             raise ReplacementError("保存後の検証に失敗しました。", "ページサイズが変わっています。")
 
+        moved_source_texts = {
+            move.spec.old_text for move in information_moves
+        }
         for item in prepared:
             spec = item.spec
+            if (
+                spec.page_index == INFORMATION_SOURCE_PAGE_INDEX
+                and any(line in moved_source_texts for line in spec.new_lines)
+            ):
+                continue
             page = output_doc[spec.page_index]
             expected_line_rectangles = _planned_line_rectangles(pymupdf, item)
             for line_number, new_line in enumerate(spec.new_lines, start=1):
@@ -2017,6 +2550,22 @@ def validate_output_pdf(
                     "保存後の検証に失敗しました。",
                     f"{spec.label}の変更前文字列が残っています。",
                 )
+
+        information_source_page = output_doc[INFORMATION_SOURCE_PAGE_INDEX]
+        information_destination_page = output_doc[INFORMATION_DESTINATION_PAGE_INDEX]
+        for item in information_moves:
+            if information_source_page.search_for(item.spec.old_text):
+                raise ReplacementError(
+                    "保存後の検証に失敗しました。",
+                    f"4ページ目に「{item.spec.old_text}」が残っています。",
+                )
+            _validate_inserted_line(
+                information_destination_page,
+                item.spec,
+                1,
+                item.spec.new_lines[0],
+                item.destination_rect,
+            )
 
         for move in moves:
             page = output_doc[move.page_index]
@@ -2204,7 +2753,7 @@ def validate_output_pdf(
                 "保存後の検証に失敗しました。",
                 f"維持する文字列「{REQUIRED_WEEKLY_TEXT}」が見つかりません。",
             )
-        reception_page = output_doc[RECEPTION_START_PAGE_INDEX]
+        reception_page = output_doc[INFORMATION_DESTINATION_PAGE_INDEX]
         for required_text in REQUIRED_RECEPTION_TEXTS:
             if not reception_page.search_for(required_text):
                 raise ReplacementError(
@@ -2212,7 +2761,7 @@ def validate_output_pdf(
                     f"維持する文字列「{required_text}」が見つかりません。",
                 )
 
-        edited_pages = {spec.page_index for spec in REPLACEMENTS}
+        edited_pages = edited_page_indexes()
         for index, original_text in enumerate(snapshot.page_texts):
             if index not in edited_pages and output_doc[index].get_text() != original_text:
                 raise ReplacementError(
@@ -2234,6 +2783,13 @@ def validate_output_pdf(
         for move in moves:
             allowed_by_page.setdefault(move.page_index, []).append(
                 AllowedChange(move.text, move.changed_rect)
+            )
+        for item in information_moves:
+            allowed_by_page.setdefault(INFORMATION_SOURCE_PAGE_INDEX, []).append(
+                AllowedChange(f"{item.spec.label}（移動元）", item.style.bbox)
+            )
+            allowed_by_page.setdefault(INFORMATION_DESTINATION_PAGE_INDEX, []).append(
+                AllowedChange(f"{item.spec.label}（移動先）", item.destination_rect)
             )
         diagnostics = []
         for page_index, allowed_changes in allowed_by_page.items():
@@ -2268,6 +2824,7 @@ def save_and_validate(
     snapshot: DocumentSnapshot,
     prepared: Sequence[PreparedReplacement],
     moves: Sequence[PreparedMove],
+    information_moves: Sequence[PreparedInformationMove],
     original_heading_rect: Any,
     description_plan: GeneralDescriptionPlan,
 ) -> None:
@@ -2284,6 +2841,7 @@ def save_and_validate(
                 snapshot,
                 prepared,
                 moves,
+                information_moves,
                 original_heading_rect,
                 description_plan,
             )
@@ -2333,9 +2891,9 @@ def _available_comparison_path(program_dir: Path, phase: str, page_number: int) 
 def render_comparison_images(
     doc: Any, program_dir: Path, phase: str
 ) -> tuple[Path, ...]:
-    """3・4ページ目をPDFとは独立した確認用PNGへ描画する。"""
+    """3～5ページ目をPDFとは独立した確認用PNGへ描画する。"""
     paths: list[Path] = []
-    for page_index in sorted({spec.page_index for spec in REPLACEMENTS}):
+    for page_index in sorted(edited_page_indexes()):
         path = _available_comparison_path(program_dir, phase, page_index + 1)
         pixmap = doc[page_index].get_pixmap(dpi=COMPARISON_DPI, alpha=False)
         pixmap.save(path)
@@ -2350,13 +2908,20 @@ def write_error_file(program_dir: Path, error: ReplacementError) -> Path | None:
         lines = [
             "処理結果：エラー",
             f"入力PDF：{INPUT_PDF_NAME}",
-            "対象ページ：3ページ目、4ページ目",
+            "対象ページ：3ページ目、4ページ目、5ページ目",
         ]
         for replacement in REPLACEMENTS:
             lines.extend(
                 (
                     f"{replacement.label}検索文字列：{replacement.old_text}",
                     f"{replacement.label}変更後文字列：{replacement.new_text}",
+                )
+            )
+        for information_move in INFORMATION_MOVES:
+            lines.extend(
+                (
+                    f"{information_move.label}移動元文字列：{information_move.old_text}",
+                    f"{information_move.label}移動先文字列：{information_move.new_text}",
                 )
             )
         lines.extend(
@@ -2383,7 +2948,7 @@ def write_error_file(program_dir: Path, error: ReplacementError) -> Path | None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """4箇所の文字列差し替えを安全に実行する。"""
+    """指定文字列の差し替えと4ページ目から5ページ目への移動を安全に実行する。"""
     args = parse_arguments(argv)
     program_dir = Path(__file__).resolve().parent
     doc: Any | None = None
@@ -2405,6 +2970,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         snapshot = snapshot_document(doc)
 
         apply_replacements(pymupdf, doc, prepared, moves)
+        doc = refresh_after_replacements(pymupdf, doc)
+        information_moves = prepare_information_moves(pymupdf, doc)
+        apply_information_moves(pymupdf, doc, information_moves)
         save_and_validate(
             pymupdf,
             doc,
@@ -2412,6 +2980,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             snapshot,
             prepared,
             moves,
+            information_moves,
             general_schedule_heading_rect,
             description_plan,
         )
