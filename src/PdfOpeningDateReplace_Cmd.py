@@ -429,6 +429,34 @@ def group_overlapping_rectangles(rectangles: Sequence[Any]) -> tuple[SearchGroup
     return tuple(groups)
 
 
+def _find_fragmented_text_groups(page: Any, text: str) -> tuple[SearchGroup, ...]:
+    """字間の広い文字を1行単位で復元し、同じ表示位置のレイヤーをまとめる。"""
+    normalized_text = normalize_whitespace_for_comparison(text)
+    line_rectangles = []
+    for block in page.get_text("rawdict").get("blocks", []):
+        for line in block.get("lines", []):
+            characters = [
+                character
+                for span in line.get("spans", [])
+                for character in span.get("chars", [])
+            ]
+            combined_text = "".join(str(character.get("c", "")) for character in characters)
+            if normalize_whitespace_for_comparison(combined_text) != normalized_text:
+                continue
+            visible_characters = [
+                character
+                for character in characters
+                if not str(character.get("c", "")).isspace()
+            ]
+            if not visible_characters:
+                continue
+            line_rect = page.rect.__class__(visible_characters[0]["bbox"])
+            for character in visible_characters[1:]:
+                line_rect |= page.rect.__class__(character["bbox"])
+            line_rectangles.append(line_rect)
+    return group_overlapping_rectangles(tuple(line_rectangles))
+
+
 def find_target_text(page: Any, spec: ReplacementSpec) -> SearchGroup:
     """旧文字列を検索し、表示位置が厳密に1グループの場合だけ返す。"""
     rectangles = tuple(page.search_for(spec.old_text))
@@ -451,9 +479,23 @@ def find_target_text(page: Any, spec: ReplacementSpec) -> SearchGroup:
     groups = group_overlapping_rectangles(rectangles)
     print(f"表示グループ数：{len(groups)}件")
     if len(groups) != 1:
+        fragmented_groups = _find_fragmented_text_groups(page, spec.old_text)
+        print(f"行単位で復元した表示グループ数：{len(fragmented_groups)}件")
+        if len(fragmented_groups) == 1:
+            print(
+                "字間によって分割された検索結果を、PDF内部の行情報から"
+                "1つの表示位置として復元しました。"
+            )
+            print(
+                "復元した表示グループの和集合："
+                f"{tuple(fragmented_groups[0].union_rect)}"
+            )
+            return fragmented_groups[0]
         raise ReplacementError(
             "変更対象が異なる表示位置に複数見つかったため、処理を中止しました。",
-            f"対象ページ：{spec.page_index + 1}ページ目／表示グループ数：{len(groups)}件",
+            f"対象ページ：{spec.page_index + 1}ページ目／"
+            f"表示グループ数：{len(groups)}件／"
+            f"行単位復元後：{len(fragmented_groups)}件",
         )
     print(f"表示グループの和集合：{tuple(groups[0].union_rect)}")
     return groups[0]
