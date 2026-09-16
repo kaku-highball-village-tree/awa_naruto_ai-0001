@@ -342,6 +342,27 @@ INFORMATION_MOVES = (
     ),
 )
 
+INFORMATION_MOVES = (
+    ReplacementSpec(
+        "募集期間見出し",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        RECRUITMENT_HEADING_TEXT,
+        (RECRUITMENT_HEADING_TEXT,),
+    ),
+    ReplacementSpec(
+        "受付開始日",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        NEW_RECEPTION_START_TEXT,
+        (NEW_RECEPTION_START_TEXT,),
+    ),
+    ReplacementSpec(
+        "募集期間注記",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        RECRUITMENT_NOTE_TEXT,
+        (RECRUITMENT_NOTE_TEXT,),
+    ),
+)
+
 
 def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """コマンドライン引数を解析する。"""
@@ -1916,6 +1937,54 @@ def apply_replacements(
         insert_moved_text(pymupdf, page, move, font_number)
 
 
+def _has_replaced_reception_text(doc: Any) -> bool:
+    """4ページ目で旧受付開始日が消え、置換後文字列が検索できるか返す。"""
+    page = doc[INFORMATION_SOURCE_PAGE_INDEX]
+    return not page.search_for(OLD_RECEPTION_START_TEXT) and bool(
+        page.search_for(NEW_RECEPTION_START_TEXT)
+    )
+
+
+def refresh_after_replacements(pymupdf: Any, doc: Any) -> Any:
+    """置換後文字列を再検索できる文書へ更新し、必要ならメモリ上で開き直す。"""
+    try:
+        page = doc[INFORMATION_SOURCE_PAGE_INDEX]
+        doc.reload_page(page)
+        print("文字列置換後の4ページ目を再読み込みしました。")
+    except Exception as exc:
+        print(f"4ページ目を直接再読み込みできませんでした：{exc}")
+
+    if _has_replaced_reception_text(doc):
+        print(f"置換後文字列を確認しました：{NEW_RECEPTION_START_TEXT}\n")
+        return doc
+
+    print("置換後文字列を再認識するため、PDFをメモリ上で開き直します。")
+    try:
+        refreshed_doc = pymupdf.open(stream=doc.tobytes(), filetype="pdf")
+    except Exception as exc:
+        raise ReplacementError(
+            "文字列置換後のPDFを開き直せませんでした。", str(exc)
+        ) from exc
+    if refreshed_doc.needs_pass or refreshed_doc.is_encrypted:
+        refreshed_doc.close()
+        raise ReplacementError("文字列置換後のPDFが暗号化されています。")
+    if refreshed_doc.page_count != doc.page_count:
+        refreshed_doc.close()
+        raise ReplacementError(
+            "文字列置換後のPDFを開き直したところページ数が変わりました。"
+        )
+    if not _has_replaced_reception_text(refreshed_doc):
+        refreshed_doc.close()
+        raise ReplacementError(
+            "置換後の受付開始日を再検索できませんでした。",
+            f"対象ページ：4ページ目／検索文字列：{NEW_RECEPTION_START_TEXT}",
+        )
+
+    doc.close()
+    print(f"置換後文字列を確認しました：{NEW_RECEPTION_START_TEXT}\n")
+    return refreshed_doc
+
+
 def _render_hash(page: Any) -> str:
     """対象外ページの見た目を比較する等倍RGB画像ハッシュを返す。"""
     pixmap = page.get_pixmap(alpha=False)
@@ -2962,6 +3031,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         snapshot = snapshot_document(doc)
 
         apply_replacements(pymupdf, doc, prepared, moves)
+        doc = refresh_after_replacements(pymupdf, doc)
         information_moves = prepare_information_moves(pymupdf, doc)
         apply_information_moves(pymupdf, doc, information_moves)
         save_and_validate(
