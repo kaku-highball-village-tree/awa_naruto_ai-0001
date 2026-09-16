@@ -429,32 +429,118 @@ def group_overlapping_rectangles(rectangles: Sequence[Any]) -> tuple[SearchGroup
     return tuple(groups)
 
 
-def _find_fragmented_text_groups(page: Any, text: str) -> tuple[SearchGroup, ...]:
-    """字間の広い文字を1行単位で復元し、同じ表示位置のレイヤーをまとめる。"""
-    normalized_text = normalize_whitespace_for_comparison(text)
-    line_rectangles = []
+def _character_for_search_group(page: Any, group: SearchGroup) -> str:
+    """1つの表示グループと重なる内部文字が一意なら、その文字を返す。"""
+    characters = set()
     for block in page.get_text("rawdict").get("blocks", []):
         for line in block.get("lines", []):
-            characters = [
-                character
-                for span in line.get("spans", [])
-                for character in span.get("chars", [])
-            ]
-            combined_text = "".join(str(character.get("c", "")) for character in characters)
-            if normalize_whitespace_for_comparison(combined_text) != normalized_text:
+            for span in line.get("spans", []):
+                for character in span.get("chars", []):
+                    character_text = normalize_whitespace_for_comparison(
+                        str(character.get("c", ""))
+                    )
+                    if not character_text:
+                        continue
+                    character_rect = page.rect.__class__(character["bbox"])
+                    if overlap_ratio(character_rect, group.union_rect) >= 0.5:
+                        characters.add(character_text)
+    return next(iter(characters)) if len(characters) == 1 else ""
+
+
+def _fragmented_groups_form_one_line(groups: Sequence[SearchGroup]) -> bool:
+    """文字グループが同じ行を左から右へ妥当な間隔で並ぶか確認する。"""
+    if not groups:
+        return False
+    maximum_height = max(group.union_rect.height for group in groups)
+    center_y_values = tuple(
+        (group.union_rect.y0 + group.union_rect.y1) / 2.0 for group in groups
+    )
+    center_y_difference = max(center_y_values) - min(center_y_values)
+    center_y_tolerance = maximum_height * 0.35
+    print(f"分割グループの中心Y最大差：{center_y_difference}")
+    print(f"分割グループの中心Y許容差：{center_y_tolerance}")
+    if center_y_difference > center_y_tolerance:
+        return False
+
+    for number, (previous, current) in enumerate(
+        zip(groups, groups[1:]), start=1
+    ):
+        if current.union_rect.x0 <= previous.union_rect.x0:
+            return False
+        gap = current.union_rect.x0 - previous.union_rect.x1
+        size_reference = max(
+            previous.union_rect.width,
+            current.union_rect.width,
+            previous.union_rect.height,
+            current.union_rect.height,
+        )
+        minimum_gap = -size_reference * 0.25
+        maximum_gap = size_reference * 1.5
+        print(
+            f"分割グループ間隔 {number}：{gap}／"
+            f"許容範囲={minimum_gap}～{maximum_gap}"
+        )
+        if gap < minimum_gap or gap > maximum_gap:
+            return False
+    return True
+
+
+def _find_fragmented_text_groups(
+    page: Any, text: str, initial_groups: Sequence[SearchGroup]
+) -> tuple[SearchGroup, ...]:
+    """文字単位の検索グループを座標と内部文字から安全に再構成する。"""
+    target_characters = tuple(normalize_whitespace_for_comparison(text))
+    if len(target_characters) < 2:
+        return ()
+
+    detected = tuple(
+        (group, _character_for_search_group(page, group)) for group in initial_groups
+    )
+    ordered = tuple(sorted(detected, key=lambda item: item[0].union_rect.x0))
+    for number, (group, character) in enumerate(ordered, start=1):
+        print(
+            f"分割グループ {number}：{character or '判定不能'}／"
+            f"bbox={tuple(group.union_rect)}／重複矩形数={len(group.rectangles)}件"
+        )
+
+    candidate_sequences: list[tuple[tuple[SearchGroup, str], ...]] = []
+
+    def collect_sequences(
+        character_index: int,
+        minimum_x: float,
+        selected: tuple[tuple[SearchGroup, str], ...],
+    ) -> None:
+        if character_index == len(target_characters):
+            candidate_sequences.append(selected)
+            return
+        expected_character = target_characters[character_index]
+        for item in ordered:
+            group, character = item
+            if character != expected_character or group.union_rect.x0 <= minimum_x:
                 continue
-            visible_characters = [
-                character
-                for character in characters
-                if not str(character.get("c", "")).isspace()
-            ]
-            if not visible_characters:
-                continue
-            line_rect = page.rect.__class__(visible_characters[0]["bbox"])
-            for character in visible_characters[1:]:
-                line_rect |= page.rect.__class__(character["bbox"])
-            line_rectangles.append(line_rect)
-    return group_overlapping_rectangles(tuple(line_rectangles))
+            collect_sequences(
+                character_index + 1,
+                group.union_rect.x0,
+                (*selected, item),
+            )
+
+    collect_sequences(0, float("-inf"), ())
+    candidates = []
+    for sequence in candidate_sequences:
+        groups = tuple(item[0] for item in sequence)
+        candidate_text = "".join(item[1] for item in sequence)
+        if not _fragmented_groups_form_one_line(groups):
+            continue
+        rectangles = tuple(
+            rectangle for group in groups for rectangle in group.rectangles
+        )
+        union_rect = rectangles[0].__class__(rectangles[0])
+        for rectangle in rectangles[1:]:
+            union_rect |= rectangle
+        candidates.append(SearchGroup(rectangles, union_rect))
+        print(f"再構成候補文字列：{candidate_text}")
+
+    return tuple(candidates)
 
 
 def find_target_text(page: Any, spec: ReplacementSpec) -> SearchGroup:
@@ -479,11 +565,13 @@ def find_target_text(page: Any, spec: ReplacementSpec) -> SearchGroup:
     groups = group_overlapping_rectangles(rectangles)
     print(f"表示グループ数：{len(groups)}件")
     if len(groups) != 1:
-        fragmented_groups = _find_fragmented_text_groups(page, spec.old_text)
-        print(f"行単位で復元した表示グループ数：{len(fragmented_groups)}件")
+        print("検索結果が文字単位に分割されている可能性があります。")
+        print("分割表示グループを文字列として再構成します。")
+        fragmented_groups = _find_fragmented_text_groups(page, spec.old_text, groups)
+        print(f"再構成後表示グループ数：{len(fragmented_groups)}件")
         if len(fragmented_groups) == 1:
             print(
-                "字間によって分割された検索結果を、PDF内部の行情報から"
+                "字間によって分割された検索結果を、PDF内部の文字情報から"
                 "1つの表示位置として復元しました。"
             )
             print(
@@ -495,7 +583,7 @@ def find_target_text(page: Any, spec: ReplacementSpec) -> SearchGroup:
             "変更対象が異なる表示位置に複数見つかったため、処理を中止しました。",
             f"対象ページ：{spec.page_index + 1}ページ目／"
             f"表示グループ数：{len(groups)}件／"
-            f"行単位復元後：{len(fragmented_groups)}件",
+            f"再構成後：{len(fragmented_groups)}件",
         )
     print(f"表示グループの和集合：{tuple(groups[0].union_rect)}")
     return groups[0]
@@ -579,7 +667,113 @@ def _matching_text_layers(
                     representative_span.get("descender"),
                 )
             )
-    return tuple(layers)
+    if layers:
+        return tuple(layers)
+    return _matching_fragmented_text_layer(page, spec, search_group)
+
+
+def _matching_fragmented_text_layer(
+    page: Any, spec: ReplacementSpec, search_group: SearchGroup
+) -> tuple[TextLayer, ...]:
+    """rawdictで別行になった分割文字から代表書式を復元する。"""
+    character_groups = tuple(
+        sorted(
+            group_overlapping_rectangles(search_group.rectangles),
+            key=lambda group: group.union_rect.x0,
+        )
+    )
+    reconstructed_text = "".join(
+        _character_for_search_group(page, group) for group in character_groups
+    )
+    if normalize_whitespace_for_comparison(reconstructed_text) != (
+        normalize_whitespace_for_comparison(spec.old_text)
+    ):
+        return ()
+
+    candidates = []
+    for block in page.get_text("rawdict").get("blocks", []):
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                for character in span.get("chars", []):
+                    character_text = normalize_whitespace_for_comparison(
+                        str(character.get("c", ""))
+                    )
+                    if not character_text:
+                        continue
+                    character_rect = page.rect.__class__(character["bbox"])
+                    if any(
+                        overlap_ratio(character_rect, group.union_rect) >= 0.5
+                        for group in character_groups
+                    ):
+                        candidates.append((character, span))
+    if not candidates:
+        return ()
+
+    signature_counts: dict[tuple[str, float, int, int], int] = {}
+    for _, span in candidates:
+        signature = (
+            str(span.get("font", "")),
+            float(span.get("size", 0.0)),
+            int(span.get("color", 0)),
+            int(span.get("flags", 0)),
+        )
+        signature_counts[signature] = signature_counts.get(signature, 0) + 1
+    representative_signature = max(
+        signature_counts,
+        key=lambda signature: (
+            signature_counts[signature],
+            "t3" not in signature[0].lower()
+            and "type3" not in signature[0].lower(),
+        ),
+    )
+    representative_character, representative_span = next(
+        (character, span)
+        for character, span in candidates
+        if (
+            str(span.get("font", "")),
+            float(span.get("size", 0.0)),
+            int(span.get("color", 0)),
+            int(span.get("flags", 0)),
+        )
+        == representative_signature
+    )
+    first_group = character_groups[0]
+    first_candidates = [
+        (character, span)
+        for character, span in candidates
+        if overlap_ratio(
+            page.rect.__class__(character["bbox"]), first_group.union_rect
+        )
+        >= 0.5
+        and (
+            str(span.get("font", "")),
+            float(span.get("size", 0.0)),
+            int(span.get("color", 0)),
+            int(span.get("flags", 0)),
+        )
+        == representative_signature
+    ]
+    if first_candidates:
+        representative_character, representative_span = first_candidates[0]
+    origin_value = representative_character.get(
+        "origin",
+        representative_span.get(
+            "origin", (search_group.union_rect.x0, search_group.union_rect.y1)
+        ),
+    )
+    return (
+        TextLayer(
+            spec.old_text,
+            search_group.union_rect,
+            representative_signature[0],
+            representative_signature[1],
+            representative_signature[2],
+            representative_signature[3],
+            (float(origin_value[0]), float(origin_value[1])),
+            representative_span.get("ascender"),
+            representative_span.get("descender"),
+        ),
+    )
 
 
 def _choose_representative_layer(layers: Sequence[TextLayer]) -> TextLayer:
@@ -608,6 +802,20 @@ def _ensure_deletion_rectangles_are_safe(
 ) -> None:
     """交差span群の空白除去後文字列と座標が対象に一致することを確認する。"""
     normalized_old_text = normalize_whitespace_for_comparison(spec.old_text)
+    character_groups = group_overlapping_rectangles(search_group.rectangles)
+    if len(character_groups) > 1:
+        ordered_groups = tuple(
+            sorted(character_groups, key=lambda group: group.union_rect.x0)
+        )
+        reconstructed_text = "".join(
+            _character_for_search_group(page, group) for group in ordered_groups
+        )
+        if normalize_whitespace_for_comparison(reconstructed_text) != normalized_old_text:
+            raise ReplacementError(
+                "変更対象以外の文字を削除する可能性があるため、処理を中止しました。",
+                f"処理対象：{spec.label}／再構成文字列：{reconstructed_text}",
+            )
+        return
     for block in page.get_text("dict").get("blocks", []):
         for line in block.get("lines", []):
             intersecting_spans = []
@@ -698,7 +906,13 @@ def get_original_text_style(
         ascender=representative.ascender,
         descender=representative.descender,
     )
-    return style, tuple(layer.rect for layer in layers)
+    fragmented_groups = group_overlapping_rectangles(search_group.rectangles)
+    deletion_rectangles = (
+        tuple(search_group.rectangles)
+        if len(fragmented_groups) > 1
+        else tuple(layer.rect for layer in layers)
+    )
+    return style, deletion_rectangles
 
 
 def _font_candidates(is_bold: bool) -> tuple[str, ...]:
