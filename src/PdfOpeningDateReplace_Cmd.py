@@ -66,6 +66,7 @@ NEW_COMPUTER_NOTE_TEXT = "※どちらか一方でも可(パソコン推奨)"
 
 INFORMATION_SOURCE_PAGE_INDEX = 3
 INFORMATION_DESTINATION_PAGE_INDEX = 4
+INFORMATION_DESTINATION_VERTICAL_GAP = 30.0
 RECRUITMENT_HEADING_TEXT = "募集期間"
 RECRUITMENT_NOTE_TEXT = "(各コース開講前まで応募可能)"
 REQUIRED_ITEMS_HEADING_TEXT = "受講必需品"
@@ -317,6 +318,27 @@ INFORMATION_MOVES = (
         INFORMATION_SOURCE_PAGE_INDEX,
         VENUE_TEXT,
         (VENUE_TEXT,),
+    ),
+)
+
+INFORMATION_MOVES = (
+    ReplacementSpec(
+        "募集期間見出し",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        RECRUITMENT_HEADING_TEXT,
+        (RECRUITMENT_HEADING_TEXT,),
+    ),
+    ReplacementSpec(
+        "受付開始日",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        NEW_RECEPTION_START_TEXT,
+        (NEW_RECEPTION_START_TEXT,),
+    ),
+    ReplacementSpec(
+        "募集期間注記",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        RECRUITMENT_NOTE_TEXT,
+        (RECRUITMENT_NOTE_TEXT,),
     ),
 )
 
@@ -1599,9 +1621,13 @@ def _destination_text_rectangles(page: Any) -> tuple[tuple[Any, str], ...]:
 
 
 def _information_destination_rect(
-    pymupdf: Any, style: TextStyle, font_path: Path, text: str
+    pymupdf: Any,
+    style: TextStyle,
+    font_path: Path,
+    text: str,
+    origin: tuple[float, float],
 ) -> Any:
-    """元と同じ基準点・書式で5ページ目へ挿入する文字のbboxを返す。"""
+    """指定した基準点と元書式で5ページ目へ挿入する文字のbboxを返す。"""
     try:
         font = pymupdf.Font(fontfile=str(font_path))
         width = float(font.text_length(text, fontsize=style.size))
@@ -1612,25 +1638,51 @@ def _information_destination_rect(
             "移動後文字列の描画範囲を計算できませんでした。",
             f"対象：{text}／詳細：{exc}",
         ) from exc
-    top = style.origin[1] - style.size * ascender
-    bottom = style.origin[1] - style.size * descender
+    top = origin[1] - style.size * ascender
+    bottom = origin[1] - style.size * descender
     return pymupdf.Rect(
-        style.origin[0],
+        origin[0],
         min(top, bottom),
-        style.origin[0] + width,
+        origin[0] + width,
         max(top, bottom),
+    )
+
+
+def _information_destination_origin(
+    pymupdf: Any,
+    style: TextStyle,
+    font_path: Path,
+    previous_rect: Any | None,
+) -> tuple[float, float]:
+    """5ページ目上部で前の行と重ならない挿入基準点を返す。"""
+    if previous_rect is None:
+        return style.origin
+    try:
+        font = pymupdf.Font(fontfile=str(font_path))
+        ascender = float(getattr(font, "ascender", style.ascender or 1.0))
+    except Exception as exc:
+        raise ReplacementError(
+            "移動後文字列の基準点を計算できませんでした。",
+            f"詳細：{exc}",
+        ) from exc
+    return (
+        style.origin[0],
+        previous_rect.y1
+        + INFORMATION_DESTINATION_VERTICAL_GAP
+        + style.size * ascender,
     )
 
 
 def prepare_information_moves(
     pymupdf: Any, doc: Any
 ) -> tuple[PreparedInformationMove, ...]:
-    """4ページ目の8行を取得し、5ページ目の同じ座標へ安全に置けるか検査する。"""
+    """置換後の募集期間3行を取得し、5ページ目上部への配置を検査する。"""
     source_page = doc[INFORMATION_SOURCE_PAGE_INDEX]
     destination_page = doc[INFORMATION_DESTINATION_PAGE_INDEX]
     ensure_text_only_redaction_supported(pymupdf, source_page)
     existing_destination_texts = _destination_text_rectangles(destination_page)
     prepared = []
+    previous_destination_rect = None
 
     for spec in INFORMATION_MOVES:
         search_group = find_target_text(source_page, spec)
@@ -1639,8 +1691,11 @@ def prepare_information_moves(
         )
         font_path = find_japanese_font(style, spec)
         new_text = spec.new_lines[0]
+        destination_origin = _information_destination_origin(
+            pymupdf, style, font_path, previous_destination_rect
+        )
         destination_rect = _information_destination_rect(
-            pymupdf, style, font_path, new_text
+            pymupdf, style, font_path, new_text, destination_origin
         )
         if not destination_page.rect.contains(destination_rect):
             raise ReplacementError(
@@ -1663,10 +1718,11 @@ def prepare_information_moves(
                 style,
                 font_path,
                 deletion_rectangles,
-                style.origin,
+                destination_origin,
                 destination_rect,
             )
         )
+        previous_destination_rect = destination_rect
 
     for index, item in enumerate(prepared):
         for other in prepared[index + 1 :]:
@@ -2454,8 +2510,16 @@ def validate_output_pdf(
         if output_sizes != snapshot.page_sizes:
             raise ReplacementError("保存後の検証に失敗しました。", "ページサイズが変わっています。")
 
+        moved_source_texts = {
+            move.spec.old_text for move in information_moves
+        }
         for item in prepared:
             spec = item.spec
+            if (
+                spec.page_index == INFORMATION_SOURCE_PAGE_INDEX
+                and any(line in moved_source_texts for line in spec.new_lines)
+            ):
+                continue
             page = output_doc[spec.page_index]
             expected_line_rectangles = _planned_line_rectangles(pymupdf, item)
             for line_number, new_line in enumerate(spec.new_lines, start=1):
@@ -2898,6 +2962,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         snapshot = snapshot_document(doc)
 
         apply_replacements(pymupdf, doc, prepared, moves)
+        information_moves = prepare_information_moves(pymupdf, doc)
         apply_information_moves(pymupdf, doc, information_moves)
         save_and_validate(
             pymupdf,
