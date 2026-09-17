@@ -423,6 +423,45 @@ INFORMATION_MOVES = (
     ),
 )
 
+# 受講必需品・開催場所のブロックは4ページ目に残し、募集期間の3行だけを移す。
+INFORMATION_MOVES = (
+    ReplacementSpec(
+        "募集期間見出し",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        RECRUITMENT_HEADING_TEXT,
+        (RECRUITMENT_HEADING_TEXT,),
+    ),
+    ReplacementSpec(
+        "受付開始日",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        NEW_RECEPTION_START_TEXT,
+        (NEW_RECEPTION_START_TEXT,),
+    ),
+    ReplacementSpec(
+        "募集期間注記",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        RECRUITMENT_NOTE_TEXT,
+        (RECRUITMENT_NOTE_TEXT,),
+    ),
+)
+
+
+def validate_information_move_configuration() -> None:
+    """募集期間3行以外がページ間移動へ混入していないことを確認する。"""
+    expected = (
+        ("募集期間見出し", RECRUITMENT_HEADING_TEXT, RECRUITMENT_HEADING_TEXT),
+        ("受付開始日", NEW_RECEPTION_START_TEXT, NEW_RECEPTION_START_TEXT),
+        ("募集期間注記", RECRUITMENT_NOTE_TEXT, RECRUITMENT_NOTE_TEXT),
+    )
+    actual = tuple(
+        (spec.label, spec.old_text, spec.new_text) for spec in INFORMATION_MOVES
+    )
+    if actual != expected:
+        raise ReplacementError(
+            "ページ間移動の設定が募集期間3行だけになっていません。",
+            "受講必需品・開催場所は4ページ目に残してください。",
+        )
+
 
 def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """コマンドライン引数を解析する。"""
@@ -3094,6 +3133,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     program_dir = Path(__file__).resolve().parent
     doc: Any | None = None
     try:
+        validate_information_move_configuration()
         input_path = find_input_pdf(program_dir)
         output_path = find_available_path(program_dir / OUTPUT_PDF_NAME)
         pymupdf = load_pymupdf()
