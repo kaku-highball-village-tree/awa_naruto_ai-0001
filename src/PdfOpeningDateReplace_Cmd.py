@@ -264,17 +264,140 @@ REPLACEMENTS = (
         OLD_GENERAL_SCHEDULE_TEXT,
         NEW_GENERAL_SCHEDULE_LINES,
     ),
+)
+
+INFORMATION_MOVES = (
+    ReplacementSpec(
+        "募集期間見出し",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        RECRUITMENT_HEADING_TEXT,
+        (RECRUITMENT_HEADING_TEXT,),
+    ),
     ReplacementSpec(
         "受付開始日",
-        RECEPTION_START_PAGE_INDEX,
+        INFORMATION_SOURCE_PAGE_INDEX,
         OLD_RECEPTION_START_TEXT,
         (NEW_RECEPTION_START_TEXT,),
     ),
     ReplacementSpec(
+        "募集期間注記",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        RECRUITMENT_NOTE_TEXT,
+        (RECRUITMENT_NOTE_TEXT,),
+    ),
+    ReplacementSpec(
+        "受講必需品見出し",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        REQUIRED_ITEMS_HEADING_TEXT,
+        (REQUIRED_ITEMS_HEADING_TEXT,),
+    ),
+    ReplacementSpec(
+        "受講必需品",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        REQUIRED_ITEMS_TEXT,
+        (REQUIRED_ITEMS_TEXT,),
+    ),
+    ReplacementSpec(
         "パソコン推奨注意書き",
-        COMPUTER_NOTE_PAGE_INDEX,
+        INFORMATION_SOURCE_PAGE_INDEX,
         OLD_COMPUTER_NOTE_TEXT,
         (NEW_COMPUTER_NOTE_TEXT,),
+    ),
+    ReplacementSpec(
+        "開催場所見出し",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        VENUE_HEADING_TEXT,
+        (VENUE_HEADING_TEXT,),
+    ),
+    ReplacementSpec(
+        "開催場所",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        VENUE_TEXT,
+        (VENUE_TEXT,),
+    ),
+)
+
+INFORMATION_MOVES = (
+    ReplacementSpec(
+        "募集期間見出し",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        RECRUITMENT_HEADING_TEXT,
+        (RECRUITMENT_HEADING_TEXT,),
+    ),
+    ReplacementSpec(
+        "受付開始日",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        NEW_RECEPTION_START_TEXT,
+        (NEW_RECEPTION_START_TEXT,),
+    ),
+    ReplacementSpec(
+        "募集期間注記",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        RECRUITMENT_NOTE_TEXT,
+        (RECRUITMENT_NOTE_TEXT,),
+    ),
+)
+
+INFORMATION_MOVES = (
+    ReplacementSpec(
+        "募集期間見出し",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        RECRUITMENT_HEADING_TEXT,
+        (RECRUITMENT_HEADING_TEXT,),
+    ),
+    ReplacementSpec(
+        "受付開始日",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        NEW_RECEPTION_START_TEXT,
+        (NEW_RECEPTION_START_TEXT,),
+    ),
+    ReplacementSpec(
+        "募集期間注記",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        RECRUITMENT_NOTE_TEXT,
+        (RECRUITMENT_NOTE_TEXT,),
+    ),
+)
+
+INFORMATION_MOVES = (
+    ReplacementSpec(
+        "募集期間見出し",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        RECRUITMENT_HEADING_TEXT,
+        (RECRUITMENT_HEADING_TEXT,),
+    ),
+    ReplacementSpec(
+        "受付開始日",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        NEW_RECEPTION_START_TEXT,
+        (NEW_RECEPTION_START_TEXT,),
+    ),
+    ReplacementSpec(
+        "募集期間注記",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        RECRUITMENT_NOTE_TEXT,
+        (RECRUITMENT_NOTE_TEXT,),
+    ),
+)
+
+INFORMATION_MOVES = (
+    ReplacementSpec(
+        "募集期間見出し",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        RECRUITMENT_HEADING_TEXT,
+        (RECRUITMENT_HEADING_TEXT,),
+    ),
+    ReplacementSpec(
+        "受付開始日",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        NEW_RECEPTION_START_TEXT,
+        (NEW_RECEPTION_START_TEXT,),
+    ),
+    ReplacementSpec(
+        "募集期間注記",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        RECRUITMENT_NOTE_TEXT,
+        (RECRUITMENT_NOTE_TEXT,),
     ),
 )
 
@@ -2986,6 +3109,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         moves = description_plan.moves + prepare_following_line_moves(
             pymupdf, doc, prepared
         )
+        information_moves = prepare_information_moves(pymupdf, doc)
         snapshot = snapshot_document(doc)
 
         doc, information_moves = apply_replacements_then_prepare_information_moves(
