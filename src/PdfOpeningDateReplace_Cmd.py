@@ -384,6 +384,27 @@ INFORMATION_MOVES = (
     ),
 )
 
+INFORMATION_MOVES = (
+    ReplacementSpec(
+        "募集期間見出し",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        RECRUITMENT_HEADING_TEXT,
+        (RECRUITMENT_HEADING_TEXT,),
+    ),
+    ReplacementSpec(
+        "受付開始日",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        NEW_RECEPTION_START_TEXT,
+        (NEW_RECEPTION_START_TEXT,),
+    ),
+    ReplacementSpec(
+        "募集期間注記",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        RECRUITMENT_NOTE_TEXT,
+        (RECRUITMENT_NOTE_TEXT,),
+    ),
+)
+
 
 def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """コマンドライン引数を解析する。"""
@@ -2011,6 +2032,19 @@ def refresh_after_replacements(pymupdf: Any, doc: Any) -> Any:
     return refreshed_doc
 
 
+def apply_replacements_then_prepare_information_moves(
+    pymupdf: Any,
+    doc: Any,
+    prepared: Sequence[PreparedReplacement],
+    moves: Sequence[PreparedMove],
+) -> tuple[Any, tuple[PreparedInformationMove, ...]]:
+    """通常置換、再読み込み、ページ間移動準備を仕様順にまとめて実行する。"""
+    apply_replacements(pymupdf, doc, prepared, moves)
+    refreshed_doc = refresh_after_replacements(pymupdf, doc)
+    information_moves = prepare_information_moves(pymupdf, refreshed_doc)
+    return refreshed_doc, information_moves
+
+
 def _render_hash(page: Any) -> str:
     """対象外ページの見た目を比較する等倍RGB画像ハッシュを返す。"""
     pixmap = page.get_pixmap(alpha=False)
@@ -3043,6 +3077,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_path = find_available_path(program_dir / OUTPUT_PDF_NAME)
         pymupdf = load_pymupdf()
 
+        print(f"実行スクリプト：{Path(__file__).resolve()}")
         print(f"入力PDF：{input_path.name}")
         doc = open_pdf(pymupdf, input_path)
         description_plan = prepare_general_description_spacing(pymupdf, doc)
@@ -3056,9 +3091,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         information_moves = prepare_information_moves(pymupdf, doc)
         snapshot = snapshot_document(doc)
 
-        apply_replacements(pymupdf, doc, prepared, moves)
-        doc = refresh_after_replacements(pymupdf, doc)
-        information_moves = prepare_information_moves(pymupdf, doc)
+        doc, information_moves = apply_replacements_then_prepare_information_moves(
+            pymupdf, doc, prepared, moves
+        )
         apply_information_moves(pymupdf, doc, information_moves)
         save_and_validate(
             pymupdf,
