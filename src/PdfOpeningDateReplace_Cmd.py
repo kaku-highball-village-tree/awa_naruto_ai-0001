@@ -69,10 +69,6 @@ INFORMATION_DESTINATION_PAGE_INDEX = 4
 INFORMATION_DESTINATION_VERTICAL_GAP = 30.0
 RECRUITMENT_HEADING_TEXT = "募集期間"
 RECRUITMENT_NOTE_TEXT = "(各コース開講前まで応募可能)"
-REQUIRED_ITEMS_HEADING_TEXT = "受講必需品"
-REQUIRED_ITEMS_TEXT = "パソコンとスマートフォン"
-VENUE_HEADING_TEXT = "開催場所"
-VENUE_TEXT = "コミュニティーはうすTSUDOI"
 
 REQUIRED_WEEKLY_TEXT = "毎週木曜日"
 REQUIRED_RECEPTION_TEXTS = ("募集期間", "(各コース開講前まで応募可能)")
@@ -384,6 +380,28 @@ INFORMATION_MOVES = (
     ),
 )
 
+INFORMATION_MOVES = (
+    ReplacementSpec(
+        "募集期間見出し",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        RECRUITMENT_HEADING_TEXT,
+        (RECRUITMENT_HEADING_TEXT,),
+    ),
+    ReplacementSpec(
+        "受付開始日",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        NEW_RECEPTION_START_TEXT,
+        (NEW_RECEPTION_START_TEXT,),
+    ),
+    ReplacementSpec(
+        "募集期間注記",
+        INFORMATION_SOURCE_PAGE_INDEX,
+        RECRUITMENT_NOTE_TEXT,
+        (RECRUITMENT_NOTE_TEXT,),
+    ),
+)
+
+# 受講必需品・開催場所のブロックは4ページ目に残し、募集期間の3行だけを移す。
 INFORMATION_MOVES = (
     ReplacementSpec(
         "募集期間見出し",
@@ -2038,9 +2056,12 @@ def apply_replacements_then_prepare_information_moves(
     prepared: Sequence[PreparedReplacement],
     moves: Sequence[PreparedMove],
 ) -> tuple[Any, tuple[PreparedInformationMove, ...]]:
-    """通常置換、再読み込み、ページ間移動準備を仕様順にまとめて実行する。"""
+    """通常置換と再読み込みを終えてから、募集期間3行の移動を準備する。"""
     apply_replacements(pymupdf, doc, prepared, moves)
     refreshed_doc = refresh_after_replacements(pymupdf, doc)
+    print(
+        "通常置換後の募集期間3行だけを4ページ目から5ページ目へ移動します。"
+    )
     information_moves = prepare_information_moves(pymupdf, refreshed_doc)
     return refreshed_doc, information_moves
 
