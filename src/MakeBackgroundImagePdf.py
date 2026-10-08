@@ -70,6 +70,8 @@ SMILE_SHAPES = (
 
 # 2ページ目中央の黒・緑の線は、原稿内では513×9pxの小さな画像として格納されている。
 RASTERIZED_LINE_BBOX = (0.0, 627.0, 513.0, 636.0)
+RASTERIZED_LINE_SIZE = (513, 9)
+RASTERIZED_LINE_PATH_BBOX = (3.97, 627.73, 508.83, 635.76)
 
 
 class PdfProcessingError(Exception):
@@ -260,13 +262,14 @@ def _drawing_matches(drawing: dict, bbox: tuple[float, float, float, float], col
 
 
 def _remove_known_decorations(page: "fitz.Page", page_index: int) -> tuple["fitz.Page", list[str]]:
-    """指定ページの視覚署名が一致する図形だけを、背景画像を保って除去する。"""
+    """指定ページの視覚署名が一致する要素だけを、背景を保って除去する。"""
     if page_index == 2:
         return page, ["追加図形除去: 対象なし"]
 
     drawings = page.get_drawings()
     pending: list[tuple[str, "fitz.Rect", list[tuple[tuple[float, float, float, float], tuple[float, float, float]]]]] = []
     statuses: list[tuple[str, str]] = []
+    raster_line: dict | None = None
 
     if page_index == 0:
         matches: list[int] = []
@@ -289,6 +292,45 @@ def _remove_known_decorations(page: "fitz.Page", page_index: int) -> tuple["fitz
         else:
             statuses.append((label, "識別できず未除去"))
 
+    if page_index == 1:
+        images = page.get_image_info(xrefs=True)
+        raster_matches = [
+            image
+            for image in images
+            if (image.get("width"), image.get("height")) == RASTERIZED_LINE_SIZE
+            and image.get("xref") == 0
+            and _near_bbox(fitz.Rect(image["bbox"]), RASTERIZED_LINE_BBOX, 1.5)
+        ]
+        if len(raster_matches) == 1:
+            raster_line = raster_matches[0]
+            raster_rect = fitz.Rect(raster_line["bbox"])
+            # この画像の同じ描画範囲には、PDF上で一緒に配置された透明な
+            # パスもある。画像だけのredactionでは線が残るため、対象の
+            # パスも固有の位置・属性で識別できる場合に限り同時に除去する。
+            companion_paths = [
+                drawing for drawing in drawings
+                if drawing.get("type") == "f"
+                and _near_bbox(drawing["rect"], RASTERIZED_LINE_PATH_BBOX, 1.5)
+                and _near_color(drawing.get("fill"), (0.0, 0.0, 0.0))
+                and abs(float(drawing.get("fill_opacity", 1.0) or 0.0)) <= 0.02
+            ]
+            # images=1 は矩形に触れる画像全体を削除するため、対象画像以外が
+            # 1ptの安全域に重なる場合は処理を中止して警告する。
+            image_redaction_rect = raster_rect + (-1.0, -1.0, 1.0, 1.0)
+            intersecting_images = [
+                image for image in images if fitz.Rect(image["bbox"]).intersects(image_redaction_rect)
+            ]
+            if len(intersecting_images) != 1:
+                raster_line = None
+                statuses.append(("中央付近の黒色と緑色の横線", "範囲内に別画像が重なるため未除去"))
+            elif len(companion_paths) != 1:
+                raster_line = None
+                statuses.append(("中央付近の黒色と緑色の横線", "付随する描画パスを一意に識別できず未除去"))
+        elif len(raster_matches) > 1:
+            statuses.append(("中央付近の黒色と緑色の横線", "画像オブジェクトを一意に識別できず未除去"))
+        else:
+            statuses.append(("中央付近の黒色と緑色の横線", "対象画像を識別できず未除去"))
+
     for label, rectangle, _ in pending:
         # fill=None は透明。画像を塗りつぶさず、矩形に触れるベクター描画だけを除去する。
         # 2ptの余白を設け、曲線や線幅によるbbox境界の丸め誤差を吸収する。
@@ -310,13 +352,21 @@ def _remove_known_decorations(page: "fitz.Page", page_index: int) -> tuple["fitz
         )
         statuses.append((label, "識別した描画を除去" if not still_present else "除去を確認できず"))
 
-    if page_index == 1:
-        images = page.get_image_info(xrefs=True)
-        raster_match = any(_near_bbox(fitz.Rect(image["bbox"]), RASTERIZED_LINE_BBOX, 1.5) for image in images)
-        if raster_match:
-            statuses.append(("中央付近の黒色と緑色の横線", "画像に焼き込まれているため未除去"))
-        else:
-            statuses.append(("中央付近の黒色と緑色の横線", "対象画像を識別できず未除去"))
+    if raster_line is not None:
+        raster_rect = fitz.Rect(raster_line["bbox"])
+        page.add_redact_annot(raster_rect + (-1.0, -1.0, 1.0, 1.0), fill=None, cross_out=False)
+        # 画像と同じ位置にある固有の付随パスも一緒に除去する。周囲の
+        # 背景長方形はredaction矩形に完全には収まらず、対象にならない。
+        page.apply_redactions(images=1, graphics=1, text=1)
+        page = page.parent.reload_page(page)
+        remaining_images = page.get_image_info(xrefs=True)
+        remains = any(
+            (image.get("width"), image.get("height")) == RASTERIZED_LINE_SIZE
+            and image.get("xref") == 0
+            and _near_bbox(fitz.Rect(image["bbox"]), RASTERIZED_LINE_BBOX, 1.5)
+            for image in remaining_images
+        )
+        statuses.append(("中央付近の黒色と緑色の横線", "除去を確認" if not remains else "除去を確認できず"))
 
     return page, [f"{label}: {result}" for label, result in statuses]
 
