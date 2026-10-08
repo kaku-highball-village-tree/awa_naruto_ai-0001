@@ -40,6 +40,36 @@ REMOVABLE_ANNOTATION_TYPES = {
     "StrikeOut",
 }
 
+# 添付原稿で確認した図形の位置・色・透明度。色だけでは判定せず、ページと
+# バウンディングボックスを含む署名が一致した対象だけを透明な redaction で除去する。
+DECORATION_TARGETS = {
+    0: [
+        ("オレンジ横線", (103.27, 151.83, 252.35, 156.10), (0.6784, 0.3373, 0.1176), 1.0),
+    ],
+    1: [
+        ("ピンク長方形", (7.00, 491.86, 161.80, 550.93), (1.0, 0.4000, 0.7686), 0.25),
+        ("オレンジ横線", (599.64, 684.91, 771.30, 689.83), (0.6784, 0.3373, 0.1176), 1.0),
+    ],
+    3: [
+        ("上部の黄色半透明長方形", (25.21, 584.68, 350.41, 661.25), (1.0, 0.9294, 0.0), 0.45),
+        ("下部の黄色半透明長方形", (25.21, 816.72, 289.32, 893.29), (1.0, 0.9294, 0.0), 0.45),
+    ],
+    4: [
+        ("下部の茶色半透明長方形", (336.10, 805.04, 829.98, 977.30), (0.6784, 0.3373, 0.1176), 1.0),
+    ],
+}
+
+SMILE_SHAPES = (
+    ((294.42, 949.23, 347.50, 1003.22), (0.9765, 0.9255, 0.1922)),
+    ((309.82, 972.39, 329.16, 982.42), (0.0, 0.0, 0.0)),
+    ((292.49, 945.31, 347.96, 997.38), (0.0, 0.0, 0.0)),
+    ((308.26, 959.35, 316.24, 967.38), (0.0, 0.0, 0.0)),
+    ((323.11, 962.91, 330.63, 970.93), (0.0, 0.0, 0.0)),
+)
+
+# 2ページ目中央の黒・緑の線は、原稿内では513×9pxの小さな画像として格納されている。
+RASTERIZED_LINE_BBOX = (0.0, 627.0, 513.0, 636.0)
+
 
 class PdfProcessingError(Exception):
     """入力PDFを安全に処理できない場合のエラー。"""
@@ -212,6 +242,84 @@ def _same_page_size(first: fitz.Page, second: fitz.Page) -> bool:
     return abs(first.rect.width - second.rect.width) < 0.01 and abs(first.rect.height - second.rect.height) < 0.01
 
 
+def _near_bbox(rectangle: "fitz.Rect", expected: tuple[float, float, float, float], tolerance: float = 2.0) -> bool:
+    return all(abs(actual - target) <= tolerance for actual, target in zip(rectangle, expected))
+
+
+def _near_color(actual: tuple[float, ...] | None, expected: tuple[float, float, float]) -> bool:
+    return actual is not None and len(actual) >= 3 and all(abs(actual[i] - expected[i]) <= 0.015 for i in range(3))
+
+
+def _drawing_matches(drawing: dict, bbox: tuple[float, float, float, float], color: tuple[float, float, float], opacity: float) -> bool:
+    return (
+        _near_bbox(drawing["rect"], bbox)
+        and _near_color(drawing.get("fill"), color)
+        and abs(float(drawing.get("fill_opacity", 1.0) or 0.0) - opacity) <= 0.06
+    )
+
+
+def _remove_known_decorations(page: "fitz.Page", page_index: int) -> tuple["fitz.Page", list[str]]:
+    """指定ページの視覚署名が一致する図形だけを、背景画像を保って除去する。"""
+    if page_index == 2:
+        return page, ["追加図形除去: 対象なし"]
+
+    drawings = page.get_drawings()
+    pending: list[tuple[str, "fitz.Rect", list[tuple[tuple[float, float, float, float], tuple[float, float, float]]]]] = []
+    statuses: list[tuple[str, str]] = []
+
+    if page_index == 0:
+        matches: list[int] = []
+        for bbox, color in SMILE_SHAPES:
+            found = [i for i, drawing in enumerate(drawings) if _drawing_matches(drawing, bbox, color, 1.0)]
+            if len(found) != 1:
+                matches = []
+                break
+            matches.extend(found)
+        if len(matches) == len(SMILE_SHAPES):
+            smile_rect = fitz.Rect(292.49, 945.31, 347.96, 1003.22)
+            pending.append(("下部の黄色いスマイルマーク", smile_rect, list(SMILE_SHAPES)))
+        else:
+            statuses.append(("下部の黄色いスマイルマーク", "識別できず未除去"))
+
+    for label, bbox, color, opacity in DECORATION_TARGETS.get(page_index, []):
+        matches = [drawing for drawing in drawings if _drawing_matches(drawing, bbox, color, opacity)]
+        if len(matches) == 1:
+            pending.append((label, fitz.Rect(*bbox), [(bbox, color)]))
+        else:
+            statuses.append((label, "識別できず未除去"))
+
+    for label, rectangle, _ in pending:
+        # fill=None は透明。画像を塗りつぶさず、矩形に触れるベクター描画だけを除去する。
+        # 2ptの余白を設け、曲線や線幅によるbbox境界の丸め誤差を吸収する。
+        page.add_redact_annot(rectangle + (-2.0, -2.0, 2.0, 2.0), fill=None, cross_out=False)
+    if pending:
+        page.apply_redactions(images=0, graphics=1, text=1)
+        # MuPDFのページ描画キャッシュを更新してから、実際に消えたか確認する。
+        page = page.parent.reload_page(page)
+
+    remaining = page.get_drawings()
+    for label, _, signatures in pending:
+        still_present = any(
+            _drawing_matches(drawing, bbox, color, 1.0 if page_index == 0 else next(
+                (opacity for target_label, target_bbox, _, opacity in DECORATION_TARGETS.get(page_index, [])
+                 if target_label == label and target_bbox == bbox), 1.0
+            ))
+            for drawing in remaining
+            for bbox, color in signatures
+        )
+        statuses.append((label, "識別した描画を除去" if not still_present else "除去を確認できず"))
+
+    if page_index == 1:
+        images = page.get_image_info(xrefs=True)
+        raster_match = any(_near_bbox(fitz.Rect(image["bbox"]), RASTERIZED_LINE_BBOX, 1.5) for image in images)
+        if raster_match:
+            statuses.append(("中央付近の黒色と緑色の横線", "画像に焼き込まれているため未除去"))
+        else:
+            statuses.append(("中央付近の黒色と緑色の横線", "対象画像を識別できず未除去"))
+
+    return page, [f"{label}: {result}" for label, result in statuses]
+
+
 def process_pdf(input_path: Path, output_path: Path) -> list[str]:
     """PDFを処理し、ページごとの検証・警告メッセージを返す。"""
     if fitz is None:
@@ -230,7 +338,7 @@ def process_pdf(input_path: Path, output_path: Path) -> list[str]:
         source.close()
         raise PdfProcessingError("暗号化されたPDFは処理できません。")
 
-    page_details: list[tuple[int, int, int, int, int]] = []
+    page_details: list[tuple[int, int, int, int, int, list[str]]] = []
     warnings: list[str] = []
     original_sizes = [(page.rect.width, page.rect.height) for page in source]
     page_count = source.page_count
@@ -257,12 +365,14 @@ def process_pdf(input_path: Path, output_path: Path) -> list[str]:
                     removed_annotations += 1
                 annotation = following
 
+            page, decoration_statuses = _remove_known_decorations(page, page_index)
+
             residual_text = len(page.get_text("text").strip())
             try:
                 drawing_count = len(page.get_drawings())
             except Exception:
                 drawing_count = -1
-            page_details.append((text_objects, removed_annotations, residual_text, drawing_count, len(page.get_images(full=True))))
+            page_details.append((text_objects, removed_annotations, residual_text, drawing_count, len(page.get_images(full=True)), decoration_statuses))
 
         # 一時ファイルに保存し、再度開けることを確認してから出力先へ移す。
         with tempfile.NamedTemporaryFile(prefix="background_pdf_", suffix=".pdf", dir=output_path.parent, delete=False) as temp:
@@ -294,13 +404,17 @@ def process_pdf(input_path: Path, output_path: Path) -> list[str]:
         raise PdfProcessingError(f"PDFを処理できませんでした: {exc}") from exc
 
     messages = [f"出力しました: {output_path}", f"ページ数: {page_count}（維持を確認）", f"Form XObject内のテキストブロック除去数: {removed_forms}"]
-    for index, (text_objects, annotations, residual, drawings, images) in enumerate(page_details, 1):
+    for index, (text_objects, annotations, residual, drawings, images, decorations) in enumerate(page_details, 1):
         width, height = original_sizes[index - 1]
         messages.append(
             f"{index}ページ目: サイズ {width:.2f} × {height:.2f} pt（維持）, "
             f"テキストブロック除去 {text_objects}, 図形注釈除去 {annotations}, "
             f"残存テキスト文字数 {residual}, 描画要素 {drawings}, 画像 {images}"
         )
+        messages.extend(f"  {status}" for status in decorations)
+        for status in decorations:
+            if "未除去" in status or "識別できず" in status or "確認できず" in status:
+                warnings.append(f"{index}ページ目: {status}")
         if drawings > 0:
             warnings.append(
                 f"{index}ページ目: コンテンツストリーム内にベクター描画要素が残っています。"
